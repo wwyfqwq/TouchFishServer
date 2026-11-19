@@ -102,6 +102,7 @@ class InstantConnect():
         self.clients_token = dict()
         self.clients_session = dict()
         self.send_queue = dict()
+        self._closing_slow_clients = {}
         self.user_cursor = user_cursor
         self.group_cursor = group_cursor
         self.messages_cursor = messages_cursor
@@ -348,12 +349,20 @@ class InstantConnect():
         try:
             queue.put_nowait(message)
         except asyncio.QueueFull:
-            uid = self.clients_belonged.get(websocket)
-            print("[WARN] WS 发送队列已满，断开慢客户端(uid={})".format(uid))
-            try:
-                await websocket.close(code=1013)
-            except Exception:
-                pass
+            if websocket not in self._closing_slow_clients:
+                self._closing_slow_clients[websocket] = asyncio.create_task(
+                    self._close_slow_client(websocket)
+                )
+
+    async def _close_slow_client(self, websocket):
+        uid = self.clients_belonged.get(websocket)
+        print("[WARN] WS 发送队列已满，断开慢客户端(uid={})".format(uid))
+        try:
+            await websocket.close(code=1013)
+        except Exception:
+            pass
+        finally:
+            self._closing_slow_clients.pop(websocket, None)
 
     def _queue_ack(self, websocket, client_mid=None, status="sent", mid=None, error=None):
         if client_mid is None or websocket not in self.send_queue or self.loop is None:
@@ -816,17 +825,19 @@ class InstantConnect():
         if self.loop is None:
             return [message for _, message in prepared]
         with self._clients_lock:
-            client_map = {
-                uid: list(self.connected_clients.get(uid, []))
-                for uid, _ in prepared
-            }
-        for uid, message in prepared:
-            for websocket in client_map.get(uid, []):
-                asyncio.run_coroutine_threadsafe(
-                    self._queue_message(websocket, {"type" : "MESSAGE.NEW", "message" : message}),
-                    self.loop
-                )
+            deliveries = [
+                (websocket, message)
+                for uid, message in prepared
+                for websocket in self.connected_clients.get(uid, ())
+            ]
+        if deliveries:
+            asyncio.run_coroutine_threadsafe(self._queue_group_messages(deliveries), self.loop)
         return [message for _, message in prepared]
+
+    async def _queue_group_messages(self, deliveries):
+        # Schedule the group once; each connection still owns its queue and encryption key.
+        for websocket, message in deliveries:
+            await self._queue_message(websocket, {"type": "MESSAGE.NEW", "message": message})
 
     def disconnect_user(self, uid : int):
         if self.loop is None:
