@@ -399,6 +399,15 @@ class FileDb(Db):
         rows = self.query("SELECT chunk_index, size FROM chunk_upload_parts WHERE file_id = ?", (file_id,))
         return {int(row[0]): int(row[1] or 0) for row in rows}
 
+    def get_user_reserved_storage(self, uid : int):
+        rows = self.query(
+            """SELECT COALESCE(SUM(p.size), 0)
+               FROM chunk_upload_parts p JOIN chunk_upload_tasks t ON p.file_id = t.file_id
+               WHERE t.uid = ? AND t.status IN ('uploading', 'finalizing')""",
+            (uid,),
+        )
+        return int(rows[0][0])
+
     def claim_chunk_finalize(self, file_id : str):
         """把任务从 uploading 抢占为 finalizing，防止并发合并"""
         with self.lock:

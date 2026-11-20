@@ -30,6 +30,7 @@ from mention_utils import resolve_mentioned_uids, should_alert, alert_from_prefe
 import time
 import threading
 from config_utils import get_features, normalize_default_join_targets, feature_gate, merge_features, SETTINGS_SPEC
+from config_utils import DEFAULT_MIN_PASSWORD_LENGTH, password_allowed
 from json_store import read_json, update_json
 from datetime import datetime
 from file_types import IMAGE_TYPES, detect_file_type, is_sticker_type
@@ -200,10 +201,9 @@ def can_recall_message(operator_uid : int, operator_auth : str, message : dict,
 
 
 def public_email_visible(row) -> bool:
-    """users 表 public_email 列（位序见 db.user.USERS_COL_*），没有就是 public！"""
+    """仅在用户资料允许时对外展示邮箱。"""
     index = USERS_COL_PUBLIC_EMAIL
-    value = row[index] if len(row) > index else 1
-    return value is None or bool(value)
+    return len(row) > index and bool(row[index])
 
 
 def show_read_status_visible(row) -> bool:
@@ -357,11 +357,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_stat == "pending":
             return "pending_activation"
         if user_stat == "banned":
-            _sweep_legacy_ban(uid)
-            row = user_cursor.uid_query(uid)
-            user_stat = row[0][4] if row else user_stat
-            if user_stat == "banned":
-                return "account_banned"
+            return "account_banned"
         punishment = punishments_cursor.active_restriction(uid) \
             if punishments_cursor is not None else None
         if punishment is None:
@@ -673,7 +669,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "max_introduction_length" : cfg.get("max_introduction_length", 500),
             "max_post_content_length" : cfg.get("max_post_content_length", 20000),
             "min_username_length" : cfg.get("min_username_length", 4),
-            "min_password_length" : cfg.get("min_password_length", 1),
+            "min_password_length" : cfg.get("min_password_length", DEFAULT_MIN_PASSWORD_LENGTH),
             "max_sticker_packs_per_user" : cfg.get("max_sticker_packs_per_user", 24),
             "max_stickers_per_pack" : cfg.get("max_stickers_per_pack", 24),
             "daily_sticker_pack_creation_limit" : cfg.get("daily_sticker_pack_creation_limit", -1),
@@ -1168,14 +1164,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not user_cursor.update_user_with_root_guard(target_uid, stat=new_auth):
             return False
 
-        # 吊销全部 JWT；封禁时把人家的 WebSocket 全部使用尖头靴子踢掉
-        user_cursor.bump_auth_version(target_uid)
-        if new_auth == "banned":
-            if not run_critical_side_effect(
-                "disconnect_banned_user",
-                lambda: instant_contact.disconnect_user(target_uid)
-            ):
-                return False
+        if not run_critical_side_effect(
+            "disconnect_user", lambda: instant_contact.disconnect_user(target_uid)
+        ):
+            return False
 
         notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(new_auth), sender=uid, meta={"new_auth" : new_auth})
         return True
@@ -1388,13 +1380,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if row and row[0][4] == "pending":
             # 独立错误码：客户端据此跳激活页，而不是显示"账号被封禁"
             return {"error": "pending_activation"}
-        # 先清历史遗留的 banned 再判定：旧数据的封禁状态没有对应处罚记录，
-        # 若不在登录入口清理，这些账号既登不进来、也进不到能触发清理的页面。
-        if row and row[0][4] == "banned":
-            _sweep_legacy_ban(uid)
-            row = user_cursor.uid_query(uid)
         if _active_ban(uid) is not None or (row and row[0][4] == "banned"):
-            # 封禁以处罚表为准；users.stat='banned' 只用于兼容历史数据
             return {"error": "account_banned"}
         return create_session_for_user(uid, device_id, device_name, platform)
 
@@ -1490,7 +1476,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return {"error": "auth_failed"}
         # 封禁必须能打断续期：只拦登录的话，封禁前建立的会话
         # 可以靠 refresh 一直续下去（默认 7 天），等于没封。
-        if _active_ban(uid) is not None:
+        account = get_user_row(uid)
+        if account is None:
+            return {"error": "auth_failed"}
+        if account[4] == "banned" or _active_ban(uid) is not None:
             return {"error": "account_banned"}
         auth_version = user_cursor.get_auth_version(uid)
 
@@ -2028,9 +2017,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             new_pwd = req["new_pwd"]
             if not verify_user(uid, pwd):
                 return bool_res()[False]
-            user_cursor.change_pwd(uid, new_pwd)
-            user_cursor.bump_auth_version(uid)
-            return bool_res()[True]
+            if not password_allowed(new_pwd, read_config()) or not user_cursor.change_pwd(uid, new_pwd):
+                return bool_res()[False]
+            return bool_res()[run_critical_side_effect(
+                "disconnect_user", lambda: instant_contact.disconnect_user(uid)
+            )]
         except Exception:
             return bool_res()[False]
 
@@ -2168,7 +2159,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         is_captcha = cfg.get("captcha", False)
         is_email_activate = cfg.get("email_activate", "")
         if (not isinstance(username, str) or len(username) < int(cfg.get("min_username_length", 4))
-                or not isinstance(password, str) or len(password) < int(cfg.get("min_password_length", 1))):
+                or not password_allowed(password, cfg)):
             return bool_res()[False]
         
         if is_captcha:
@@ -2189,23 +2180,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if "email" in req.keys():
             email = req["email"] 
         
-        if is_email_activate:
-            sender_email = cfg["email_activate"]
-            if not email:
-                return bool_res()[False]
-            email_pwd = cfg["email_password"]
-            # 后台发送，避免 SMTP 阻塞 waitress 线程；队列满时才拒绝
-            if not register_tool.email_code_async(
-                    sender_email, port_api, email, email_pwd,
-                    locks['config'], locks['activate']):
-                return bool_res()[False]
-
-        succeeded = user_cursor.user_create(username, password, time.time(), email)
+        if is_email_activate and not email:
+            return bool_res()[False]
+        initial_stat = "pending" if is_email_activate else "user"
+        succeeded = user_cursor.user_create(username, password, time.time(), email, stat=initial_stat)
         if not succeeded:
             return bool_res()[False]
         target_uid = user_cursor.username_query(username)[0][0]
-        if is_email_activate and succeeded:
-            user_cursor.change_auth(target_uid, "pending")
+        if is_email_activate and not register_tool.email_code_async(
+                cfg["email_activate"], port_api, email, cfg["email_password"],
+                locks['config'], locks['activate'], uid=target_uid, purpose="activate"):
+            user_cursor.delete_user(target_uid)
+            return bool_res()[False]
         if not ensure_notification_table(target_uid):
             user_cursor.delete_user(target_uid)
             return bool_res()[False]
@@ -2220,16 +2206,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if uid_row is None:
             return bool_res()[False]
         email = uid_row[2]
-        with locks['activate']:
-            with open("res/{}/activate.json".format(port_api), "r+") as file:
-                pending = email in json.load(file).keys()
-        if not pending:
-            # 没有待验证记录：已激活的账号视为成功,仍被封禁说明流程异常
-            return bool_res()[uid_row[4] != "banned"]
-        if register_tool.verify_email(port_api, email, activate_code, locks['activate']):
-            user_cursor.change_auth(uid, "user")
-            return bool_res()[True]
-        return bool_res()[False]
+        if uid_row[4] != "pending":
+            return bool_res()[uid_row[4] not in _BLOCKED_STATS]
+        if not register_tool.verify_email(port_api, email, activate_code, locks['activate'],
+                                          uid=uid, purpose="activate"):
+            return bool_res()[False]
+        return bool_res()[user_cursor.activate_pending(uid, email)]
 
     @api("/auth/resend_activation", methods=["POST"])
     def resend_activation(req):
@@ -2242,7 +2224,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid_row = get_user_row(uid)
         if uid_row is None:
             return bool_res()[False]
-        if uid_row[4] not in _BLOCKED_STATS:
+        if uid_row[4] == "banned":
+            return bool_res()[False]
+        if uid_row[4] != "pending":
             # 已经激活过：不需要再发，按成功处理（幂等）
             return bool_res()[True]
         email = uid_row[2]
@@ -2252,7 +2236,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         return bool_res()[register_tool.email_code_async(
             sender_email, port_api, email, cfg.get("email_password", ""),
-            locks['config'], locks['activate'])]
+            locks['config'], locks['activate'], uid=uid_row[0], purpose="activate")]
 
     @api("/auth/forgot_password", methods=["POST"])
     def forgot_password(req):
@@ -2272,7 +2256,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         try:
             if not register_tool.email_code_async(
                     sender_email, port_api, email, email_pwd,
-                    locks['config'], locks['activate']):
+                    locks['config'], locks['activate'], uid=rows[0][0], purpose="reset"):
                 return bool_res()[False]
         except Exception as e:
             print("[WARN] forgot_password email send failed: {}".format(e))
@@ -2287,7 +2271,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         new_pwd = req.get("new_pwd")
         if not isinstance(email, str) or not email:
             return bool_res()[False]
-        if not isinstance(new_pwd, str) or not new_pwd:
+        if not password_allowed(new_pwd, read_config()):
             return bool_res()[False]
         try:
             code = int(activate_code)
@@ -2297,12 +2281,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not rows:
             return bool_res()[False]
         uid = rows[0][0]
-        if not register_tool.verify_email(port_api, email, code, locks['activate']):
+        if not register_tool.verify_email(port_api, email, code, locks['activate'],
+                                          uid=uid, purpose="reset"):
             return bool_res()[False]
-        user_cursor.change_pwd(uid, new_pwd)
-        user_cursor.bump_auth_version(uid)
-        user_cursor.delete_tokens(uid)
-        return bool_res()[True]
+        if not user_cursor.change_pwd(uid, new_pwd):
+            return bool_res()[False]
+        return bool_res()[run_critical_side_effect(
+            "disconnect_user", lambda: instant_contact.disconnect_user(uid)
+        )]
 
      
 
@@ -2334,7 +2320,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 return bool_res()[False]
             cfg = read_config()
             if (not isinstance(username, str) or len(username) < int(cfg.get("min_username_length", 4))
-                    or not isinstance(target_password, str) or len(target_password) < int(cfg.get("min_password_length", 1))):
+                    or not password_allowed(target_password, cfg)):
                 return bool_res()[False]
 
             if not user_cursor.user_create(username, target_password, time.time(), email, stat=new_auth):
@@ -2387,19 +2373,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     not isinstance(updates["username"], str)
                     or len(updates["username"]) < int(cfg.get("min_username_length", 4))):
                 return bool_res()[False]
-            if "password" in updates and (
-                    not isinstance(updates["password"], str)
-                    or len(updates["password"]) < int(cfg.get("min_password_length", 1))):
+            if "password" in updates and not password_allowed(updates["password"], cfg):
                 return bool_res()[False]
 
             if not user_cursor.update_user_with_root_guard(target_uid, **updates):
                 return bool_res()[False]
 
             if "password" in updates or next_auth is not None:
-                user_cursor.bump_auth_version(target_uid)
-            if next_auth == "banned":
                 if not run_critical_side_effect(
-                    "disconnect_banned_user",
+                    "disconnect_user",
                     lambda: instant_contact.disconnect_user(target_uid)
                 ):
                     return bool_res()[False]
@@ -4586,19 +4568,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "封禁期间无法登录，如认为有误可联系管理员申诉。"),
     }
 
-    def _sweep_legacy_ban(uid):
-        """
-        清理历史遗留 users.stat='banned'
-        """
-        row = user_cursor.uid_query(uid)
-        if not row or row[0][4] != "banned":
-            return
-        if _active_ban(uid) is not None:
-            return
-        user_cursor.change_auth(uid, "user")
-        notify_user(uid, "punishment.expired", "处罚已到期",
-                    "你的封禁已到期，账号已恢复正常。")
-
     @api("/punishment/create", methods=["POST"])
     def punishment_create(req):
         uid = req["uid"]
@@ -4668,7 +4637,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         if target_uid != uid and not _is_manager(uid):
             return bool_res()[False]
-        _sweep_legacy_ban(target_uid)
         rows = punishments_cursor.list_for_user(target_uid)
         now = time.time()
         items = []
@@ -4700,7 +4668,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         punishments_cursor.revoke(punishment_id, uid)
 
         target_uid = row[1]
-        _sweep_legacy_ban(target_uid)
         notify_user(target_uid, "punishment.revoked", "处罚已解除",
                     "你的一条处罚已被解除。", sender=uid,
                     meta={"punishment_id": punishment_id})
@@ -4839,7 +4806,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if quota != -1 or max_quota != -1:
                 if not file_cursor.has_active_user_file(uid, new_hashes):
                     new_size = len(payload)
-                    current_usage = file_cursor.get_user_storage_used(uid)
+                    current_usage = file_cursor.get_user_storage_used(uid) + file_cursor.get_user_reserved_storage(uid)
                     if quota != -1 and current_usage + new_size > quota:
                         return json.dumps({"success": False, "error": "Storage quota exceeded"})
                     # 瞬时单用户文件总大小不得超过 max_user_storage_quota（默认 70MB）
@@ -4858,31 +4825,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "info_url" : "/file/get_file_info/{}".format(hashes),
             "file" : file_metadata(hashes, uid),
         }, ensure_ascii=False)
-
-    def enforce_chunked_upload_quota(uid : int, result : dict, cfg : dict):
-        """
-        分块上传 finalize 之后的配额核对
-        """
-        if not (result.get("success") and result.get("file_hash")):
-            return None
-        quota = cfg.get("user_storage_quota", -1)
-        max_quota = cfg.get("max_user_storage_quota", 73400320)
-        if quota == -1 and max_quota == -1:
-            return None
-        hashes = result["file_hash"]
-        meta = file_metadata(hashes, uid) or {}
-        new_size = int(meta.get("size") or meta.get("file_size") or 0)
-        if not new_size:
-            return None
-        current_usage = file_cursor.get_user_storage_used(uid)
-        if ((quota != -1 and current_usage > quota)
-                or (max_quota != -1 and current_usage > max_quota)):
-            file.dereference_file(
-                port_api, uid, hashes, file_cursor,
-                cfg.get("file_last_time", 72),
-            )
-            return "Storage quota exceeded"
-        return None
 
     # Experimental: streaming chunked upload (rebased + hardened from Leitarkkk #5).
     @api('/file/chunked_upload', methods=['POST'])
@@ -4927,13 +4869,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 if not ext or ext not in allowed_extensions:
                     return json.dumps({"success": False, "error": "Extension not allowed"}, ensure_ascii=False)
 
-            is_final_chunk = (
-                isinstance(chunk_index, int) and isinstance(chunk_total, int)
-                and chunk_total > 0 and chunk_index == chunk_total - 1
-            )
-
-            def upload_chunks():
-                return file.chunked_upload_file(
+            limits = (cfg.get("user_storage_quota", -1), cfg.get("max_user_storage_quota", 73400320))
+            with quota_lock(uid):
+                result = file.chunked_upload_file(
                     port_api,
                     uid,
                     normalized_name,
@@ -4943,20 +4881,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     file_id,
                     file_cursor,
                     expected_hash,
-                )
-
-            if is_final_chunk:
-                with quota_lock(uid):
-                    result = upload_chunks()
-                    quota_error = enforce_chunked_upload_quota(uid, result, cfg)
-            else:
-                result = upload_chunks()
-                quota_error = None
-
-            if quota_error:
-                return json.dumps(
-                    {"success": False, "error": quota_error},
-                    ensure_ascii=False,
+                    max_file_size=read_upload_limit(cfg, "max_file_size"),
+                    storage_quota=min((limit for limit in limits if limit >= 0), default=-1),
                 )
 
             if result.get("success") and result.get("file_hash"):
@@ -5020,11 +4946,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             extension = blob_info.get("extension") or os.path.splitext(normalized_name)[1].lower()
             mime_type = blob_info.get("mime_type")
             new_size = blob_info.get("size") or resolve_file_size(file_hash)
+            max_file_size = read_upload_limit(cfg, "max_file_size")
+            if max_file_size >= 0 and new_size > max_file_size:
+                return {"success": False, "error": "File too large"}
 
             quota = cfg.get("user_storage_quota", -1)
             max_quota = cfg.get("max_user_storage_quota", 73400320)
             with quota_lock(uid):
-                current_usage = file_cursor.get_user_storage_used(uid)
+                current_usage = file_cursor.get_user_storage_used(uid) + file_cursor.get_user_reserved_storage(uid)
                 if new_size and not file_cursor.has_active_user_file(uid, file_hash):
                     if quota != -1 and current_usage + new_size > quota:
                         return {"success": False, "error": "Storage quota exceeded"}

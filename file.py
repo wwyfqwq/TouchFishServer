@@ -389,7 +389,10 @@ def force_delete_file(port_api : int, hashes : str, file_cursor : FileDb):
 # Task state lives in file.db (chunk_upload_tasks / chunk_upload_parts), part files in
 # res/<port>/tmp/. Hardened vs the original #5 draft: DB-tracked chunks, incremental hash,
 # per-file size ceiling, uid-scoped tasks, concurrent-upload limit, idempotent finalize.
-def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index : int, chunk_total : int, chunk_data_b64 : str, file_id : str = None, file_cursor : FileDb = None, expected_hash : str = None):
+def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index : int,
+                        chunk_total : int, chunk_data_b64 : str, file_id : str = None,
+                        file_cursor : FileDb = None, expected_hash : str = None, *,
+                        max_file_size : int = -1, storage_quota : int = -1):
     """
     Stream a file in chunks to avoid loading the whole payload into RAM.
 
@@ -421,7 +424,9 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
     except Exception:
         return {"success": False, "error": "Directory creation failed"}
 
-    if chunk_index == 0:
+    first_chunk = chunk_index == 0
+    parts = {}
+    if first_chunk:
         file_id = sha256("{}{}{}".format(time.time(), uid, uuid.uuid4().hex))
         try:
             error, expired_ids = file_cursor.create_chunk_task(uid, file_id, file_name, chunk_total, expected_hash)
@@ -445,18 +450,34 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
         if task["status"] == "done" and task.get("file_hash"):
             # 客户端在响应丢失后重发？
             return {"success": True, "file_hash": task["file_hash"], "verified": bool(task["verified"])}
+        if task["status"] != "uploading":
+            return {"success": False, "error": "Upload in progress"}
+        parts = file_cursor.list_chunk_parts(file_id)
+
+    # The caller holds the same per-user lock as full and instant uploads.
+    # A retry replaces the previous part, so reserve only its size difference.
+    growth = len(decoded_chunk) - parts.get(chunk_index, 0)
+    error = None
+    if max_file_size >= 0 and sum(parts.values()) + growth > max_file_size:
+        error = "File too large"
+    elif storage_quota >= 0:
+        allocated = file_cursor.get_user_storage_used(uid) + file_cursor.get_user_reserved_storage(uid)
+        if allocated + growth > storage_quota:
+            error = "Storage quota exceeded"
+    if error:
+        if first_chunk:
+            file_cursor.delete_chunk_task(file_id)
+        return {"success": False, "error": error}
 
     try:
+        file_cursor.touch_chunk_task(file_id)
+        file_cursor.upsert_chunk_part(file_id, chunk_index, len(decoded_chunk))
         with open(_chunk_path(port_api, file_id, chunk_index), "wb") as f:
             f.write(decoded_chunk)
     except Exception:
+        file_cursor.delete_chunk_task(file_id)
+        _remove_chunk_files(port_api, file_id)
         return {"success": False, "error": "Write failed"}
-
-    try:
-        file_cursor.upsert_chunk_part(file_id, chunk_index, len(decoded_chunk))
-        file_cursor.touch_chunk_task(file_id)
-    except Exception:
-        return {"success": False, "error": "Failed to record chunk info"}
 
     if chunk_index == chunk_total - 1:
         return _finalize_chunked_upload(port_api, uid, file_name, file_id, chunk_total, expected_hash, file_cursor)

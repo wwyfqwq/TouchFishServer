@@ -205,7 +205,7 @@ class InstantConnect():
     def _verify_ws_token(self, token: str):
         """
         校验词元（bushi）
-        返回 (uid, jti, sid) 或 None。
+        返回 (uid, jti, sid, auth_version, exp) 或 None。
         """
         def _check():
             # 本服签发 token：HS* 用 jwt_secret，非对称用密钥环（按 kid 选钥）
@@ -226,7 +226,7 @@ class InstantConnect():
                     return None
                 if int(row[1]) != int(payload.get("av", -1)):
                     return None
-                return (uid, jti, sid)
+                return (uid, jti, sid, int(row[1]), payload.get("exp"))
 
             # 外部签发 token：与 HTTP 旧版直接接受路径保持一致（sub 必须是本地 uid 且 av 匹配）。
             # 推荐仍先走 /auth/external/login 换成本地会话 token 再连 WS。
@@ -244,7 +244,7 @@ class InstantConnect():
             auth_version = self.user_cursor.get_auth_version(uid)
             if int(payload.get("av", -1)) != int(auth_version):
                 return None
-            return (uid, payload.get("jti"), payload.get("sid"))
+            return (uid, payload.get("jti"), payload.get("sid"), int(auth_version), payload.get("exp"))
         return to_thread(_check)
 
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
@@ -902,6 +902,8 @@ class InstantConnect():
         try:
             while True:
                 message = await queue.get()
+                if self.send_queue.get(websocket) is not queue:
+                    return
                 await websocket.send(self.encrypt_response(message, websocket))
         except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
             pass
@@ -925,6 +927,8 @@ class InstantConnect():
             print("[ERR] 客户端链接 WS 服务器后没有发出 AES 密钥声明")
             return
         
+        expiry_task = None
+        send_task = None
         try:
             message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
             message = json.loads(message)
@@ -934,10 +938,11 @@ class InstantConnect():
             token = message.get("token")
             verified_jti = None
             verified_sid = None
+            expires_at = None
             if token:
                 verified = await self._verify_ws_token(token)
                 if verified is not None:
-                    verified_uid, verified_jti, verified_sid = verified
+                    verified_uid, verified_jti, verified_sid, auth_version, expires_at = verified
                 else:
                     verified_uid = None
             else:
@@ -945,37 +950,57 @@ class InstantConnect():
                     verified_uid = None
                 else:
                     async with self._auth_semaphore:
+                        login_uid = int(message['uid'])
+                        auth_version = await to_thread(self.user_cursor.get_auth_version, login_uid)
                         verified = await asyncio.wait_for(
-                            to_thread(self.user_cursor.verify_user, message['uid'], message['password']),
+                            to_thread(self.user_cursor.verify_user, login_uid, message['password']),
                             timeout=10.0,
                         )
-                    verified_uid = message.get('uid') if verified else None
+                    verified_uid = login_uid if verified else None
             if verified_uid is None:
                 raise ValueError("UID 验证失败：{}".format(message.get('uid', 'token')))
+            queue = asyncio.Queue(maxsize=self.SEND_QUEUE_LIMIT)
             with self._clients_lock:
                 self.connected_clients[-1].remove(websocket)
-                became_online = not self.connected_clients.get(verified_uid)
-                if verified_uid not in self.connected_clients.keys():
-                    self.connected_clients[verified_uid] = []
-                self.connected_clients[verified_uid].append(websocket)
+                clients = self.connected_clients.setdefault(verified_uid, [])
+                became_online = not clients
                 self.clients_belonged[websocket] = verified_uid
                 self.clients_token[websocket] = verified_jti
                 self.clients_session[websocket] = verified_sid
-                self.send_queue[websocket] = asyncio.Queue(
-                    maxsize=self.SEND_QUEUE_LIMIT)
+                self.send_queue[websocket] = queue
+                clients.append(websocket)
+            # A password change can commit between credential validation and
+            # registering this socket for disconnect_user(). Check again before
+            # acknowledging the connection or draining any buffered pushes.
+            if await to_thread(self.user_cursor.get_auth_version, verified_uid) != auth_version:
+                raise ValueError("Credentials changed during login")
+            if self.send_queue.get(websocket) is not queue:
+                return
+            if expires_at is not None:
+                expires_at = int(expires_at)
+                if expires_at <= time.time():
+                    raise ValueError("Token expired")
+                expiry_task = asyncio.create_task(self._close_on_expiry(websocket, expires_at))
             await websocket.send(self.encrypt_response({"type" : "AUTH.LOGIN_SUCCEEDED"}, websocket))
-            if became_online:
+            if became_online and self.send_queue.get(websocket) is queue:
                 await to_thread(self._mark_online, verified_uid)
+            if self.send_queue.get(websocket) is not queue:
+                return
+            send_task = asyncio.create_task(self.sender(websocket, queue))
 
-        except Exception as e:
+        except Exception:
             print("[ERR] 客户端链接 WS 服务器后没有登录")
-            self._cleanup_client(websocket)
             return
-        
-        send_task = asyncio.create_task(self.sender(websocket, self.send_queue[websocket]))
+        finally:
+            if send_task is None:
+                if expiry_task is not None:
+                    expiry_task.cancel()
+                self._cleanup_client(websocket)
 
         try:
             async for message in websocket:
+                if expires_at is not None and time.time() >= expires_at:
+                    break
                 message = json.loads(message)
                 message = json.loads(crypto.aes_decrypt(base64.b64decode(message['iv']), base64.b64decode(message['content']), self.aes_key[websocket]))
                 sender_uid = self.clients_belonged[websocket]
@@ -1532,9 +1557,16 @@ class InstantConnect():
             print("[ERR] WS消息处理异常: {}".format(e))
 
         finally:
+            if expiry_task is not None:
+                expiry_task.cancel()
             send_task.cancel()
             self._cleanup_client(websocket)
             
+
+    @staticmethod
+    async def _close_on_expiry(websocket, expires_at):
+        await asyncio.sleep(max(0, expires_at - time.time()))
+        await websocket.close(code=1008, reason="Token expired")
 
     async def main(self):
         print("[INFO] 已严肃启动 TCP 服务器")

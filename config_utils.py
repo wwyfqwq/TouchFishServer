@@ -1,6 +1,14 @@
 import re
 
 
+DEFAULT_MIN_PASSWORD_LENGTH = 8
+
+
+def password_allowed(password, cfg):
+    minimum = int(cfg.get("min_password_length", DEFAULT_MIN_PASSWORD_LENGTH))
+    return isinstance(password, str) and len(password) >= max(1, minimum)
+
+
 # 服务器功能开关
 FEATURE_DEFAULTS = {
     "chat": {
@@ -103,7 +111,7 @@ SETTINGS_SPEC = [
     {"key": "min_group_name_length", "type": "int", "min": 1, "default": 1, "category": "limits"},
     {"key": "max_group_name_length", "type": "int", "min": 1, "default": 50, "category": "limits"},
     {"key": "min_username_length", "type": "int", "min": 4, "default": 4, "category": "limits"},
-    {"key": "min_password_length", "type": "int", "min": 1, "default": 1, "category": "limits"},
+    {"key": "min_password_length", "type": "int", "min": 1, "default": DEFAULT_MIN_PASSWORD_LENGTH, "category": "limits"},
     {"key": "max_sign_length", "type": "int", "min": 1, "allow_unlimited": True, "default": 100, "category": "limits"},
     {"key": "max_introduction_length", "type": "int", "min": 1, "allow_unlimited": True, "default": 500, "category": "limits"},
     {"key": "max_post_content_length", "type": "int", "min": 1, "allow_unlimited": True, "default": 20000, "category": "limits"},

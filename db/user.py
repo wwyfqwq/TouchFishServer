@@ -55,7 +55,7 @@ class UserDb(Db):
         :param create_time: 创建时间（使用时间戳）
         :param email: 邮箱地址
         """
-        if stat not in ALLOWED_USER_STATS:
+        if stat != "pending" and stat not in ALLOWED_USER_STATS:
             return False
         if not isinstance(username, str) or len(username) > 20 or len(username) < 4 or " " in username:
             return False
@@ -88,12 +88,12 @@ class UserDb(Db):
                         uid = int(self.cursor.fetchone()[0]) - 1
                     if email:
                         self.cursor.execute(
-                            "INSERT INTO users (uid, username, pwd_hash, create_time, email, stat) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO users (uid, username, pwd_hash, create_time, email, stat, public_email) VALUES (?, ?, ?, ?, ?, ?, 0)",
                             (uid, username, pwd_hash, create_time, email, stat),
                         )
                     else:
                         self.cursor.execute(
-                            "INSERT INTO users (uid, username, pwd_hash, create_time, stat) VALUES (?, ?, ?, ?, ?)",
+                            "INSERT INTO users (uid, username, pwd_hash, create_time, stat, public_email) VALUES (?, ?, ?, ?, ?, 0)",
                             (uid, username, pwd_hash, create_time, stat),
                         )
                     self.conn.commit()
@@ -271,7 +271,7 @@ class UserDb(Db):
         sign TEXT,
         introduction TEXT,
         auth_version INTEGER DEFAULT 0,
-        public_email INTEGER NOT NULL DEFAULT 1,
+        public_email INTEGER NOT NULL DEFAULT 0,
         show_read_status INTEGER NOT NULL DEFAULT 1,
         show_online_status INTEGER NOT NULL DEFAULT 1
     )
@@ -327,7 +327,7 @@ class UserDb(Db):
         if "public_email" not in columns:
             try:
                 self.execute(
-                    "ALTER TABLE users ADD COLUMN public_email INTEGER NOT NULL DEFAULT 1"
+                    "ALTER TABLE users ADD COLUMN public_email INTEGER NOT NULL DEFAULT 0"
                 )
             except Exception:
                 pass
@@ -785,17 +785,27 @@ class UserDb(Db):
 
     def bump_auth_version(self, uid):
         """使该用户已签发的全部 JWT 失效，并释放其 token 登记（避免占用配额）。"""
-        try:
-            self.execute(
-                "UPDATE users SET auth_version = auth_version + 1 WHERE uid = ?",
-                (uid,),
-            )
-            self.delete_tokens(uid)
-            self.revoke_sessions(uid)
+        def operation():
+            with self.lock:
+                self._invalidate_auth_locked(uid)
+                self.conn.commit()
             return True
+
+        try:
+            return self._execute_with_retry(operation)
         except Exception as e:
             print(e)
             return False
+
+    def _invalidate_auth_locked(self, uid):
+        self.cursor.execute(
+            "UPDATE users SET auth_version = COALESCE(auth_version, 0) + 1 WHERE uid = ?", (uid,)
+        )
+        self.cursor.execute("DELETE FROM tokens WHERE uid = ?", (uid,))
+        self.cursor.execute(
+            "UPDATE auth_sessions SET revoked_at = ? WHERE uid = ? AND revoked_at IS NULL",
+            (time.time(), uid),
+        )
     
     def create_friend_table(self):
         cmd = """
@@ -1060,8 +1070,7 @@ class UserDb(Db):
         self.execute("DELETE FROM friendship WHERE user1 = ? AND user2 = ?", (uida, uidb))
 
     def change_pwd(self, uid : int, new_pwd : str):
-        pwd_hash = self.hasher.hash(new_pwd)
-        self.execute("UPDATE users SET pwd_hash = ? where uid = ?", (pwd_hash, uid))
+        return self.update_user(uid, password=new_pwd)
 
     def change_username(self, oped : int, new_username : str):
         if not self.validate_username(new_username, oped):
@@ -1072,6 +1081,18 @@ class UserDb(Db):
         except Exception as e:
             print(e)
             return False
+
+    def activate_pending(self, uid, email):
+        def operation():
+            with self.lock:
+                self.cursor.execute(
+                    "UPDATE users SET stat = 'user' WHERE uid = ? AND email = ? AND stat = 'pending'",
+                    (uid, email),
+                )
+                changed = self.cursor.rowcount == 1
+                self.conn.commit()
+                return changed
+        return self._execute_with_retry(operation)
 
     def change_auth(self, oped : int, new_auth : str):
         self.execute("UPDATE users SET stat = ? where uid = ?", (new_auth, oped))
@@ -1104,6 +1125,8 @@ class UserDb(Db):
                 fields, values = prepared
                 values.append(uid)
                 self.cursor.execute("UPDATE users SET {} where uid = ?".format(", ".join(fields)), tuple(values))
+                if password is not _UNSET or stat is not _UNSET:
+                    self._invalidate_auth_locked(uid)
                 self.conn.commit()
                 return True
 
@@ -1136,6 +1159,8 @@ class UserDb(Db):
                 fields, values = prepared
                 values.append(uid)
                 self.cursor.execute("UPDATE users SET {} where uid = ?".format(", ".join(fields)), tuple(values))
+                if password is not _UNSET or stat is not _UNSET:
+                    self._invalidate_auth_locked(uid)
                 self.conn.commit()
                 return True
 
@@ -1191,7 +1216,7 @@ class UserDb(Db):
         self.execute("UPDATE users SET sign = ? where uid = ?", (new_sign, oped))
 
     def set_public_email(self, uid : int, public : bool) -> bool:
-        """设置是否对外公开邮箱（默认公开）。"""
+        """设置是否对外公开邮箱。"""
         self.execute(
             "UPDATE users SET public_email = ? WHERE uid = ?",
             (1 if public else 0, uid),
