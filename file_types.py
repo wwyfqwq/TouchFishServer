@@ -5,12 +5,46 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import os
 import re
 from xml.parsers import expat
 import zlib
 
 
 IMAGE_TYPES = {"png", "jpg", "gif", "bmp", "svg", "tgs"}
+
+IMAGE_MIME_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "svg": "image/svg+xml",
+    "tgs": "application/octet-stream",
+}
+
+FILE_MIMETYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+    ".opus": "audio/opus", ".weba": "audio/webm",
+    ".pdf": "application/pdf", ".zip": "application/zip",
+    ".tgs": "application/octet-stream",
+}
+
+
+def mime_from_name(name):
+    return FILE_MIMETYPES.get(
+        os.path.splitext(name or "")[1].lower(), "application/octet-stream"
+    )
+
+
+def content_type_for(file_type, file_name=""):
+    short = str(file_type or "").lower().lstrip(".")
+    if short in IMAGE_MIME_TYPES:
+        return IMAGE_MIME_TYPES[short]
+    return mime_from_name(file_name)
 
 
 MAX_STICKER_DOCUMENT_BYTES = 10 * 1024 * 1024

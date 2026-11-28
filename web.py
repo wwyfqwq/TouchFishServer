@@ -39,7 +39,7 @@ from config_utils import get_features, normalize_default_join_targets, feature_g
 from config_utils import DEFAULT_MIN_PASSWORD_LENGTH, password_allowed
 from json_store import read_json, update_json
 from datetime import datetime
-from file_types import IMAGE_TYPES, detect_file_type, is_valid_file_hash
+from file_types import IMAGE_TYPES, detect_file_type, is_valid_file_hash, mime_from_name
 import oss_store
 import external_auth_providers
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
@@ -176,24 +176,6 @@ def request_body_limit(cfg):
         if value is not None:
             payloads.append(value)
     return int(max(payloads) * SECRET_ENVELOPE_RATIO) + REQUEST_BODY_MARGIN
-
-
-FILE_MIMETYPES = {
-    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
-    ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
-    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
-    ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
-    ".opus": "audio/opus", ".weba": "audio/webm",
-    ".pdf": "application/pdf", ".zip": "application/zip",
-    ".tgs": "application/octet-stream",
-}
-
-
-def mime_from_name(name):
-    return FILE_MIMETYPES.get(
-        os.path.splitext(name or "")[1].lower(), "application/octet-stream"
-    )
 
 
 def can_recall_message(operator_uid : int, operator_auth : str, message : dict,
@@ -1265,7 +1247,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def _ensure_stat_ban(uid, operator_uid):
         if punishments_cursor is None:
             return True, None
-        if punishments_cursor.active_ban(uid) is not None:
+        if punishments_cursor.active_permanent_ban(uid) is not None:
             return True, None
         punishment_id = punishments_cursor.create(
             uid, "ban_full", STAT_BAN_REASON, operator_uid
@@ -5606,12 +5588,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         groupname = req["groupname"]
         introduction = req.get("introduction", "")
         enter_hint = req.get("enter_hint", "")
-        allow_direct_join = bool(req.get("allow_direct_join", False))
-        require_review = bool(req.get("require_review", True))
         allow_direct_join = req.get("allow_direct_join")
         require_review = req.get("require_review")
+        # None 表示老客户端没传，交给 create_group 推断 join_policy；
+        # 传了则归一化字符串布尔，避免 bool("false") 为真。
+        if allow_direct_join is not None:
+            allow_direct_join = parse_bool_flag(allow_direct_join)
+        if require_review is not None:
+            require_review = parse_bool_flag(require_review)
         join_policy = req.get("join_policy")
-        searchable = bool(req.get("searchable", True))
+        searchable = parse_bool_flag(req.get("searchable", True))
         if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
         if join_policy is not None and join_policy not in JOIN_POLICIES:
@@ -7586,6 +7572,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def send_friend_accepted_greeting(accepter_uid, requester_uid):
         if messages_cursor is None:
+            return
+        row = user_cursor.uid_query(accepter_uid)
+        if row is None or _content_block(accepter_uid, row[0][4]) is not None:
+            # 禁言/封禁用户不替他们"发出"问候
             return
         content = FRIEND_ACCEPTED_GREETING
         try:

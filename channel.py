@@ -435,14 +435,6 @@ class InstantConnect():
             return (uid, payload.get("jti"), payload.get("sid"), int(auth_version), payload.get("exp"))
         return self._auth_work(_check)
 
-    def _is_fully_banned(self, uid: int) -> bool:
-        """完全封禁 BOOM WS"""
-        if self.punishments_cursor is not None:
-            if self.punishments_cursor.active_ban(uid) is not None:
-                return True
-        row = self.user_cursor.uid_query(uid)
-        return bool(row) and row[0][4] == "banned"
-
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
         buckets = (self._ws_typing_timestamps if bucket == "typing"
                    else self._ws_read_timestamps if bucket == "read" else self._ws_timestamps)

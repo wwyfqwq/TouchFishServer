@@ -1058,9 +1058,10 @@ class MessagesDb(Db):
         if not rows:
             return None
         last_read_seq, last_read_mid, genuine_seq, deleted = rows[0]
-        # 撤回会把 mid 挪到序列末尾
-        if genuine_seq is None or deleted:
+        if genuine_seq is None:
             genuine_seq = 0
+        elif deleted:
+            genuine_seq = last_read_seq
         return {
             "last_read_seq": last_read_seq,
             "last_read_mid": last_read_mid,

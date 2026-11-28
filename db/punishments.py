@@ -130,6 +130,17 @@ CREATE TABLE IF NOT EXISTS punishment_migrations (
         """当前生效的完全封禁"""
         return self.active_of_kind(uid, "ban_full")
 
+    def active_permanent_ban(self, uid: int):
+        """当前生效的永久完全封禁（不限时）"""
+        rows = self.query(
+            "SELECT id, uid, kind, reason, issued_by, created_at, expires_at, "
+            "revoked_at, revoked_by FROM punishments "
+            "WHERE uid = ? AND kind = 'ban_full' AND revoked_at IS NULL "
+            "AND expires_at IS NULL ORDER BY created_at DESC LIMIT 1",
+            (int(uid),),
+        )
+        return rows[0] if rows else None
+
     def active_readonly_ban(self, uid: int):
         """当前生效的只读封禁"""
         return self.active_of_kind(uid, "ban")

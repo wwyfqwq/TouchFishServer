@@ -10,7 +10,7 @@ from collections import deque
 from contextlib import nullcontext
 from db import FileDb
 import hashlib
-from file_types import detect_file_type, is_valid_file_hash
+from file_types import content_type_for, detect_file_type, is_valid_file_hash
 import threading
 import oss_store
 from json_store import file_lock
@@ -241,7 +241,8 @@ def upload_file(port_api : int, uid : int, file_b64, file_name : str, file_curso
                     pass
             if oss_enabled:
                 if not need_blob or oss_store.upload_file_to_oss(
-                    port_api, disk_path, "file", hashes, content_type=file_type
+                    port_api, disk_path, "file", hashes,
+                    content_type=content_type_for(file_type, file_name),
                 ):
                     oss_store.safe_remove(disk_path)
     finally:
@@ -297,7 +298,8 @@ def upload_sticker(port_api : int, uid : int, file_b64, file_name : str, sticker
                 oss_store.safe_remove(disk_path)
             raise
         if oss_enabled and (remote_ready or oss_store.upload_file_to_oss(
-                port_api, disk_path, "sticker", hashes, content_type=file_type)):
+                port_api, disk_path, "sticker", hashes,
+                content_type=content_type_for(file_type, file_name))):
             oss_store.safe_remove(disk_path)
     return hashes
 
@@ -684,7 +686,8 @@ def _finalize_chunked_upload(port_api : int, uid : int, file_name : str, file_id
                     pass
             if oss_enabled:
                 if not need_blob or oss_store.upload_file_to_oss(
-                    port_api, final_path, "file", file_hash, content_type=file_type
+                    port_api, final_path, "file", file_hash,
+                    content_type=content_type_for(file_type, file_name),
                 ):
                     oss_store.safe_remove(final_path)
 
