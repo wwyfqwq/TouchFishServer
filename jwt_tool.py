@@ -17,6 +17,7 @@ import jwt as pyjwt
 
 import jwks_client
 import jwt_keys
+from json_store import atomic_output, file_lock, restrict_private_file
 
 
 LEGACY_NOTE = "using uid and password for general authorization is deprecated, please use the jwt auth (see details in docs)"
@@ -53,23 +54,31 @@ def secret_path(port_api) -> str:
 def generate_secret_if_missing(port_api):
     """密钥文件不存在时自动生成（HS256 密钥，32B 随机海克斯）"""
     path = secret_path(port_api)
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(secrets.token_hex(32))
+    load_secret(port_api)
     return path
 
 
 def load_secret(port_api) -> str:
-    """加载（必要时生成）JWT 签名密钥。"""
-    path = generate_secret_if_missing(port_api)
-    with open(path, "r", encoding="utf-8") as file:
-        secret = file.read().strip()
-    if not secret:
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(secrets.token_hex(32))
-        with open(path, "r", encoding="utf-8") as file:
-            secret = file.read().strip()
-    return secret
+    """Load or create one signing key across concurrent service starts."""
+    path = secret_path(port_api)
+    def read_existing():
+        try:
+            with open(path, encoding="utf-8") as file:
+                restrict_private_file(file)
+                return file.read().strip()
+        except FileNotFoundError:
+            return ""
+
+    secret = read_existing()
+    if secret:
+        return secret
+    with file_lock(path):
+        secret = read_existing()
+        if not secret:
+            secret = secrets.token_hex(32)
+            with atomic_output(path, "w", encoding="utf-8") as file:
+                file.write(secret)
+        return secret
 
 
 def issue_token(secret, uid, auth_version, expires_seconds, issuer, session_id=None,

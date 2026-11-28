@@ -41,7 +41,7 @@ def verify_token(provider, secret, token):
     provider = str(provider).lower()
     if provider not in PROVIDERS:
         return False
-    if not secret or not token:
+    if not isinstance(secret, str) or not secret or not isinstance(token, str) or not token:
         return False
 
     verify_url, _ = PROVIDERS[provider]
@@ -67,7 +67,7 @@ def verify_token(provider, secret, token):
     except (ValueError, TypeError):
         return False
 
-    return bool(result.get("success", False))
+    return isinstance(result, dict) and result.get("success") is True
 
 
 def render_page(provider, site_key):
@@ -79,7 +79,7 @@ def render_page(provider, site_key):
     返回 (html, provider, script_url)
     """
     provider = str(provider).lower()
-    if provider not in PROVIDERS or not site_key:
+    if provider not in PROVIDERS or not isinstance(site_key, str) or not site_key:
         return None, None, None
 
     _, script_url = PROVIDERS[provider]
@@ -154,9 +154,9 @@ def render_page(provider, site_key):
 </body>
 </html>"""
 
-    html = html.replace("%SITE_KEY%", json.dumps(site_key))
     html = html.replace("%GUARD%", init_guard)
     html = html.replace("%RENDER_EXPR%", render_expr)
     html = html.replace("%SCRIPT_URL%", json.dumps(script_url))
+    html = html.replace("%SITE_KEY%", json.dumps(site_key).replace("<", "\\u003c"))
 
     return html, provider, script_url

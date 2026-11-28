@@ -13,6 +13,10 @@ def escape_like(value):
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+class StickerQuotaExceeded(ValueError):
+    pass
+
+
 class StickerDb(Db):
     """表情数据库"""
 
@@ -65,6 +69,7 @@ class StickerDb(Db):
                 PRIMARY KEY (uid, hash)
             )
         """)
+        self.execute("CREATE TABLE IF NOT EXISTS sticker_upload_guards (uid INTEGER PRIMARY KEY)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_sticker_packs_creator ON sticker_packs(creator_uid, is_deleted)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_stickers_pack ON stickers(pack_id, position)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_sticker_creation_day ON sticker_pack_creation_log(uid, local_day)")
@@ -73,10 +78,27 @@ class StickerDb(Db):
 
     def register_upload(self, uid: int, hashes: str, file_name: str,
                         upload_time: float, size: int = 0,
-                        mime_type: str = None):
+                        mime_type: str = None, *, quota=-1, prepare_blob=None):
         """注册一个贴图文件的归属（uid, hash 维度）。"""
         with self.lock:
             def operation():
+                if quota >= 0:
+                    # The upsert acquires a write lock for this owner, including
+                    # first uploads on independent service connections.
+                    self.cursor.execute(
+                        "INSERT INTO sticker_upload_guards (uid) VALUES (?) "
+                        "ON CONFLICT(uid) DO UPDATE SET uid = excluded.uid", (uid,),
+                    )
+                    self.cursor.execute(
+                        "SELECT COALESCE(SUM(size), 0), "
+                        "MAX(CASE WHEN hash = ? THEN 1 ELSE 0 END) "
+                        "FROM sticker_files WHERE uid = ?", (hashes, uid),
+                    )
+                    used, owns = self.cursor.fetchone()
+                    if not owns and int(used) + size > quota:
+                        raise StickerQuotaExceeded()
+                if prepare_blob is not None:
+                    prepare_blob()
                 self.cursor.execute(
                     """INSERT INTO sticker_files
                        (uid, hash, file_name, upload_time, size, mime_type)
@@ -108,12 +130,8 @@ class StickerDb(Db):
 
     def get_user_sticker_used(self, uid: int) -> int:
         """该用户已验证贴图文件的总大小（瞬时，单位字节）。"""
-        rows = self.query(
-            "SELECT hash, size FROM sticker_files WHERE uid = ?", (uid,))
-        total = 0
-        for hashes, size in rows:
-            total += int(size or 0)
-        return total
+        rows = self.query("SELECT COALESCE(SUM(size), 0) FROM sticker_files WHERE uid = ?", (uid,))
+        return int(rows[0][0])
 
     def get_user_stickers(self, uid: int):
         """该用户上传过的贴图文件列表。"""

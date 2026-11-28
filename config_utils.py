@@ -54,12 +54,16 @@ def get_features(cfg) -> dict:
 def feature_gate(cfg, *path) -> bool:
     """按嵌套路径读取功能开关，缺键类型不对时 1111
     """
-    node = get_features(cfg)
+    defaults = FEATURE_DEFAULTS
+    value = cfg.get("features") if isinstance(cfg, dict) else None
     for part in path:
-        if not isinstance(node, dict):
+        if not isinstance(defaults, dict) or part not in defaults:
             return True
-        node = node.get(part)
-    return node if isinstance(node, bool) else True
+        defaults = defaults[part]
+        value = value.get(part) if isinstance(value, dict) else None
+    if isinstance(defaults, bool):
+        return value if isinstance(value, bool) else defaults
+    return True
 
 
 def merge_features(current, incoming) -> dict:

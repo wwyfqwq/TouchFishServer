@@ -71,6 +71,18 @@ class ForumDb(Db):
         PRIMARY KEY (fid, uid)
     )
     """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS forum_id_counters (
+                kind TEXT PRIMARY KEY,
+                next_id INTEGER NOT NULL
+            )
+        """)
+        self._seed_id_counter("forum", "fid", "forums")
+        self._seed_id_counter("post", "pid", "contents")
+        self.execute(
+            "UPDATE forums SET pinned_pid = NULL WHERE pinned_pid IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM contents "
+            "WHERE contents.fid = forums.fid AND contents.pid = forums.pinned_pid)")
         self._create_comments_table()
         self._migrate_comments_json()
 
@@ -105,8 +117,11 @@ class ForumDb(Db):
         except Exception as e:
             print("[WARN] comments.json 读取失败，暂不迁移: {}".format(e))
             return
+        if not isinstance(data, dict):
+            print("[WARN] comments.json 格式无效，保留原文件")
+            return
         rows = []
-        for fid_key, posts in (data or {}).items():
+        for fid_key, posts in data.items():
             if not isinstance(posts, dict):
                 continue
             for pid_key, thread in posts.items():
@@ -119,11 +134,12 @@ class ForumDb(Db):
                         fid_value = int(fid_key)
                         pid_value = int(pid_key)
                         created_at = float(time_stamp)
-                    except (TypeError, ValueError):
+                        uid = int(entry[0])
+                    except (TypeError, ValueError, OverflowError):
                         continue
                     rows.append((
                         fid_value, pid_value, str(time_stamp), created_at,
-                        int(entry[0]), str(entry[1]),
+                        uid, str(entry[1]),
                     ))
         if rows:
             try:
@@ -144,21 +160,28 @@ class ForumDb(Db):
     def add_comment(self, fid, pid, uid, content, time_stamp=None):
         created_at = time()
         time_stamp = str(created_at) if time_stamp is None else str(time_stamp)
+
+        def insert_comment():
+            with self.lock:
+                self.cursor.execute(
+                    "INSERT INTO post_comments "
+                    "(fid, pid, time_stamp, created_at, uid, content) "
+                    "SELECT fid, pid, ?, ?, ?, ? FROM contents WHERE fid = ? AND pid = ?",
+                    (time_stamp, created_at, int(uid), str(content), int(fid), int(pid)),
+                )
+                created = self.cursor.rowcount > 0
+                self.conn.commit()
+                return time_stamp if created else None
+
         try:
-            self.execute(
-                "INSERT INTO post_comments "
-                "(fid, pid, time_stamp, created_at, uid, content) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (int(fid), int(pid), time_stamp, created_at, int(uid), str(content)),
-            )
-            return time_stamp
+            return self._execute_with_retry(insert_comment)
         except self.dialect.IntegrityError:
             return None
 
     def get_comments(self, fid, pid):
         return self.query(
             "SELECT time_stamp, uid, content FROM post_comments "
-            "WHERE fid = ? AND pid = ? ORDER BY created_at ASC",
+            "WHERE fid = ? AND pid = ? ORDER BY created_at ASC, time_stamp ASC",
             (int(fid), int(pid)),
         )
 
@@ -217,7 +240,7 @@ class ForumDb(Db):
                       AND c.created_at = (
                         SELECT MAX(t2.created_at) FROM post_comments t2
                          WHERE t2.fid = c.fid AND t2.pid = c.pid)
-                    ORDER BY c.created_at DESC""".format(placeholders),
+                    ORDER BY c.created_at DESC, c.time_stamp DESC""".format(placeholders),
                 tuple([int(fid)] + batch),
             )
             for pid, uid, content, time_stamp, total in rows:
@@ -233,7 +256,19 @@ class ForumDb(Db):
                 }
         return summaries
 
-    
+    def _next_id_locked(self, kind):
+        self.cursor.execute(
+            "UPDATE forum_id_counters SET next_id = next_id + 1 WHERE kind = ?", (kind,))
+        self.cursor.execute("SELECT next_id FROM forum_id_counters WHERE kind = ?", (kind,))
+        return self.cursor.fetchone()[0] - 1
+
+    def _seed_id_counter(self, kind, column, table):
+        next_id = self.query(f"SELECT COALESCE(MAX({column}), -1) + 1 FROM {table}")[0][0]
+        self.execute("INSERT OR IGNORE INTO forum_id_counters (kind, next_id) VALUES (?, ?)",
+                     (kind, next_id))
+        self.execute("UPDATE forum_id_counters SET next_id = ? WHERE kind = ? AND next_id < ?",
+                     (next_id, kind, next_id))
+
     def create_forum(self, forumname, creater : int, introduction):
         """
         创建论坛
@@ -242,23 +277,12 @@ class ForumDb(Db):
         :param creater: 创建者（uid）
         :param introduction: 论坛简介
         """
-        cmd = """
-    CREATE TABLE IF NOT EXISTS F{} (
-        time_stamp REAL,
-        content TEXT
-    )"""
         def insert_forum():
-            self.cursor.execute("SELECT MAX(fid) from forums")
-            fid = self.cursor.fetchone()[0]
-            if fid == None:
-                fid = 0
-            else:
-                fid += 1
+            fid = self._next_id_locked("forum")
             self.cursor.execute(
                 "INSERT INTO forums (fid, forumname, creater, create_time, introduction, post_num) VALUES (?, ?, ?, ?, ?, 0)",
                 (fid, forumname, creater, time(), introduction)
             )
-            self.cursor.execute(cmd.format(fid))
             self.cursor.execute(
                 "INSERT INTO forum_members (fid, uid, role, join_time) VALUES (?, ?, 100, ?)",
                 (fid, creater, time())
@@ -373,12 +397,11 @@ class ForumDb(Db):
             return False
         attachments = list(attachments or [])
         def insert_post():
-            self.cursor.execute("SELECT MAX(pid) from contents")
-            pid = self.cursor.fetchone()[0]
-            if pid == None:
-                pid = 0
-            else:
-                pid += 1
+            self.cursor.execute("UPDATE forums SET post_num = COALESCE(post_num, 0) + 1 WHERE fid = ?", (fid,))
+            if self.cursor.rowcount == 0:
+                self.conn.commit()
+                return False
+            pid = self._next_id_locked("post")
             self.cursor.execute(
                 "INSERT INTO contents (fid, pid, title, creater, content, send_time) VALUES (?, ?, ?, ?, ?, ?)",
                 (fid, pid, title, sender, content, time())
@@ -395,7 +418,6 @@ class ForumDb(Db):
                        (pid, position, file_hash, display_name) VALUES (?, ?, ?, ?)""",
                     (pid, position, file_hash, display_name),
                 )
-            self.cursor.execute("UPDATE forums set post_num = post_num + 1 where fid = ?", (fid,))
             self.conn.commit()
             return pid
 
@@ -439,10 +461,23 @@ class ForumDb(Db):
         }
     
     def pin_post(self, fid : int, pid : int):
-        if not self.query_post_pid(fid, pid):
-            return False
-        self.execute("UPDATE forums SET pinned_pid = ? WHERE fid = ?", (pid, fid))
-        return True
+        def operation():
+            with self.lock:
+                self.cursor.execute(
+                    "UPDATE forums SET pinned_pid = ? WHERE fid = ? "
+                    "AND EXISTS (SELECT 1 FROM contents WHERE fid = ? AND pid = ?)",
+                    (pid, fid, fid, pid),
+                )
+                # MySQL reports zero changed rows when the same post is already pinned.
+                self.cursor.execute(
+                    "SELECT 1 FROM forums WHERE fid = ? AND pinned_pid = ?",
+                    (fid, pid),
+                )
+                pinned = self.cursor.fetchone() is not None
+                self.conn.commit()
+                return pinned
+
+        return self._execute_with_retry(operation)
 
     def unpin_post(self, fid : int):
         self.execute("UPDATE forums SET pinned_pid = NULL WHERE fid = ?", (fid,))
@@ -497,45 +532,47 @@ class ForumDb(Db):
     def delete_forum(self, fid : int):
         with self.lock:
             def operation():
-                self.cursor.execute("SELECT pid FROM contents WHERE fid = ?", (fid,))
-                post_ids = [row[0] for row in self.cursor.fetchall()]
-                attachment_hashes = []
-                if post_ids:
-                    placeholders = ",".join("?" * len(post_ids))
-                    self.cursor.execute(
-                        "SELECT file_hash FROM post_attachments WHERE pid IN ({})".format(placeholders),
-                        tuple(post_ids),
-                    )
-                    attachment_hashes = [row[0] for row in self.cursor.fetchall()]
-                    self.cursor.execute(
-                        "DELETE FROM post_attachments WHERE pid IN ({})".format(placeholders),
-                        tuple(post_ids),
-                    )
                 self.cursor.execute("DELETE FROM forums WHERE fid = ?", (fid,))
+                self.cursor.execute(
+                    "SELECT file_hash FROM post_attachments "
+                    "WHERE pid IN (SELECT pid FROM contents WHERE fid = ?)", (fid,))
+                attachment_hashes = [row[0] for row in self.cursor.fetchall()]
+                self.cursor.execute(
+                    "DELETE FROM post_attachments "
+                    "WHERE pid IN (SELECT pid FROM contents WHERE fid = ?)", (fid,))
                 self.cursor.execute("DELETE FROM contents WHERE fid = ?", (fid,))
                 self.cursor.execute("DELETE FROM forum_members WHERE fid = ?", (fid,))
                 self.cursor.execute("DELETE FROM post_comments WHERE fid = ?", (fid,))
-                self.cursor.execute("DROP TABLE IF EXISTS F{}".format(fid))
                 self.conn.commit()
                 return attachment_hashes
 
             attachment_hashes = self._execute_with_retry(operation)
+        self._drop_legacy_forum_table(fid)
         return attachment_hashes
 
+    def _drop_legacy_forum_table(self, fid):
+        # MySQL commits implicitly around DDL, so run this after the data transaction.
+        try:
+            self.execute("DROP TABLE IF EXISTS F{}".format(int(fid)))
+        except self.dialect.DatabaseError as exc:
+            print("[WARN] 无法删除旧版论坛表 F{}: {}".format(fid, exc))
+
     def delete_post(self, fid : int, pid : int):
-        if not self.query_post_pid(fid, pid):
-            return []
         def do_delete():
+            self.cursor.execute("DELETE FROM contents WHERE fid = ? AND pid = ?", (fid, pid))
+            if self.cursor.rowcount == 0:
+                self.conn.commit()
+                return []
             self.cursor.execute(
                 "SELECT file_hash FROM post_attachments WHERE pid = ? ORDER BY position", (pid,))
             attachment_hashes = [row[0] for row in self.cursor.fetchall()]
             self.cursor.execute("DELETE FROM post_attachments WHERE pid = ?", (pid,))
-            self.cursor.execute("DELETE FROM contents where pid = ?", (pid,))
             self.cursor.execute(
                 "DELETE FROM post_comments WHERE fid = ? AND pid = ?", (fid, pid))
             self.cursor.execute(
-                "UPDATE forums set post_num = CASE WHEN post_num > 0 THEN post_num - 1 ELSE 0 END where fid = ?",
-                (fid,)
+                "UPDATE forums SET post_num = CASE WHEN post_num > 0 THEN post_num - 1 ELSE 0 END, "
+                "pinned_pid = CASE WHEN pinned_pid = ? THEN NULL ELSE pinned_pid END WHERE fid = ?",
+                (pid, fid)
             )
             self.conn.commit()
             return attachment_hashes
@@ -568,7 +605,6 @@ class ForumDb(Db):
                     self.cursor.execute("DELETE FROM contents WHERE fid = ?", (fid, ))
                     self.cursor.execute("DELETE FROM forum_members WHERE fid = ?", (fid,))
                     self.cursor.execute("DELETE FROM post_comments WHERE fid = ?", (fid,))
-                    self.cursor.execute("DROP TABLE IF EXISTS F{}".format(fid))
 
                 self.cursor.execute("SELECT fid FROM forums")
                 remaining_forums = [row[0] for row in self.cursor.fetchall()]
@@ -595,7 +631,10 @@ class ForumDb(Db):
                             (fid, pid))
                     self.cursor.execute("DELETE FROM contents WHERE creater = ? and fid = ?", (uid, fid))
                     self.cursor.execute(
-                        "UPDATE forums SET post_num = CASE WHEN post_num >= ? THEN post_num - ? ELSE 0 END WHERE fid = ?",
+                        "UPDATE forums SET post_num = CASE WHEN post_num >= ? THEN post_num - ? ELSE 0 END, "
+                        "pinned_pid = CASE WHEN EXISTS (SELECT 1 FROM contents "
+                        "WHERE contents.fid = forums.fid AND contents.pid = forums.pinned_pid) "
+                        "THEN pinned_pid ELSE NULL END WHERE fid = ?",
                         (len(post_ids), len(post_ids), fid),
                     )
 
@@ -607,6 +646,8 @@ class ForumDb(Db):
 
             deleted_forums, deleted_posts, deleted_attachment_hashes = self._execute_with_retry(operation)
 
+        for fid in deleted_forums:
+            self._drop_legacy_forum_table(fid)
         if return_attachment_hashes:
             return deleted_attachment_hashes
         return True

@@ -728,14 +728,16 @@ TFV5 的消息系统由两部分组成：
 - `rate_limited` — 超过频率限制（10 条/秒）
 - `message_too_long` — 文本超过 `max_message_length`
 - `invalid_quote` — 引用消息 ID 非法
-- `invalid_target` — 接收方格式非法
+- `invalid_request` — 消息内容结构或正文类型有误
+- `invalid_target` — 接收方缺失、前缀有误或编号无效
 - `invalid_file_hash` — 文件哈希不是 64 位十六进制字符串
 - `file_not_owned` — 文件不存在或发送者没有有效的文件所有权
+- `file_reference_failed` — 保存消息时文件已失效，消息未入库，可以用同一个 `client_mid` 重试
 - `client_mid_conflict` — 当前 `client_mid` 已用于另一条目标、正文、类型或回复关系不同的消息
 - `group_not_found` — 群不存在
 - `banned` — 账号已被封禁
 
-`invalid_target` 适用于结构完整但前缀无效的目标。WebSocket 请求缺少 `send_to`、传入空字符串或无法转换的编号时，当前实现可能直接关闭连接而不返回 ACK；客户端应在发送前校验目标格式。
+这些错误只影响当前发送请求，WebSocket 连接仍可继续收发消息。有 `client_mid` 的请求会收到相应的失败 ACK。
 
 ---
 

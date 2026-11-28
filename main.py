@@ -1,4 +1,8 @@
 import argparse
+from contextlib import ExitStack
+import getpass
+from pathlib import Path
+import shutil
 import json
 import asyncio
 from argon2 import PasswordHasher
@@ -6,7 +10,7 @@ from channel import InstantConnect
 from captcha.image import ImageCaptcha
 import threading
 import web
-from json_store import update_json, write_json
+from json_store import atomic_output, read_json, update_json, write_json
 import db
 from db.dialect import SQLiteDialect, MySQLDialect, PostgreSQLDialect
 import avatar
@@ -95,39 +99,91 @@ def normalize_working_directory():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 
-def create_new_server():
-    global HASHER
-    global PUB_KEY, PRI_KEY
-    global PORT_API
-    global PORT_TCP
-    global USER_CURSOR
+def _server_ports(raw_api, raw_tcp):
+    values = tuple(int(str(raw).strip()) for raw in (raw_api, raw_tcp))
+    if any(port < 0 or port > 65535 for port in values) or values[0] == values[1]:
+        raise ValueError("请为 HTTP 和 WebSocket 指定不同的有效端口。")
+    return tuple(str(port) for port in values)
 
-    HASHER = PasswordHasher(
-        time_cost=1,
-        memory_cost=4096,
-        parallelism=2,
-        hash_len=24,
-        salt_len=16
+
+def _check_port_availability(config, ports):
+    if not isinstance(config, dict):
+        raise ValueError("server_config.json 格式有误。")
+    for existing in config.values():
+        if any(str(int(value)) in ports for value in existing):
+            raise ValueError("端口已有服务器配置，请选用已有配置或其他端口。")
+
+
+def _create_initial_root(users):
+    username = input("输入 root 用户的用户名：")
+    ask_password = getpass.getpass if sys.stdin.isatty() else input
+    password = ask_password("输入 root 用户的密码：")
+    if not password or not users.user_create(username, password, time.time(), stat="root", only_if_empty=True):
+        if users.query("SELECT 1 FROM users WHERE stat = 'root' LIMIT 1"):
+            return  # Another process initialized the same external database first.
+        raise ValueError("初始 root 账号创建失败，请检查用户名、密码和数据库状态。")
+
+
+def create_new_server():
+    global PORT_API, PORT_TCP
+    PORT_API, PORT_TCP = _server_ports(
+        input("请输入新服务器的 API 端口号（0~65535且不受防火墙阻挡）："),
+        input("请输入新服务器的 TCP 端口号（0~65535且不受防火墙阻挡且不与上者重复）："),
     )
-    PORT_API = input("请输入新服务器的 API 端口号（0~65535且不受防火墙阻挡）：")
-    PORT_TCP = input("请输入新服务器的 TCP 端口号（0~65535且不受防火墙阻挡且不与上者重复）：")
-    pri, pub, pri_pem, pub_pem, has = generate_rsa_keys()
+    ports = (PORT_API, PORT_TCP)
+    manifest = "server_config.json"
+    try:
+        existing = read_json(manifest)
+    except FileNotFoundError:
+        existing = {}
+    _check_port_availability(existing, ports)
+
+    instance = Path("res") / PORT_API
+    instance.parent.mkdir(exist_ok=True)
+    try:
+        instance.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise ValueError(f"实例目录 {instance} 已存在，请检查该目录或使用已有配置。") from error
+    identity = instance.stat()
+
+    def add_server(config):
+        _check_port_availability(config, ports)
+        next_id = max((int(key) for key in config if str(key).isdigit()), default=-1) + 1
+        config[str(next_id)] = list(ports)
+
+    try:
+        with ExitStack() as databases:
+            _initialize_new_instance(databases)
+        # Publish only after all files and the initial administrator are ready.
+        # update_json checks both ports again under the inter-process manifest lock.
+        update_json(manifest, add_server, default=dict)
+    except BaseException:
+        # At process interruption the manifest may have already been replaced.
+        # Only remove the directory exclusively created by this attempt.
+        try:
+            committed = read_json(manifest)
+        except FileNotFoundError:
+            committed = {}
+        if list(ports) not in committed.values() and os.path.samestat(identity, instance.lstat()):
+            shutil.rmtree(instance)
+        raise
+
+
+def _initialize_new_instance(databases):
+    hasher = PasswordHasher(
+        time_cost=1, memory_cost=4096, parallelism=2, hash_len=24, salt_len=16)
+    _, _, pri_pem, pub_pem, has = generate_rsa_keys()
     prt("你的 RSA 公钥 SHA256 哈希值：{}，为防止中间人攻击导致的危险，请务必将其公布于受信任处以让使用者校对！".format(has), "yellow")
     if not os.path.exists("res/{}/secret".format(PORT_API)):
-        os.makedirs("res/{}/secret".format(PORT_API))
+        os.makedirs("res/{}/secret".format(PORT_API), mode=0o700)
 
     if not os.path.exists("res/{}/captcha".format(PORT_API)):
         os.makedirs("res/{}/captcha".format(PORT_API))
     
-    with open("res/{}/secret/pub.pem".format(PORT_API), "wb") as file:
-        file.write(pub_pem)
-    with open("res/{}/secret/pri.pem".format(PORT_API), "wb") as file:
+    with atomic_output("res/{}/secret/pri.pem".format(PORT_API), "wb") as file:
         file.write(pri_pem)
-    
-    def add_server(config):
-        next_id = max((int(key) for key in config if str(key).isdigit()), default=-1) + 1
-        config[str(next_id)] = [PORT_API, PORT_TCP]
-    update_json("server_config.json", add_server, default=dict)
+    with atomic_output("res/{}/secret/pub.pem".format(PORT_API), "wb") as file:
+        file.write(pub_pem)
 
     print("创建数据库与配置文件……")
     if not os.path.exists("res/{}/db".format(PORT_API)):
@@ -200,32 +256,27 @@ def create_new_server():
     write_json("res/{}/announcement.json".format(PORT_API), {})
 
     avatar.init(PORT_API)
-    USER_CURSOR = db.UserDb(HASHER, "res/{}/db/user.db".format(PORT_API), PORT_API, PORT_TCP)
-    USER_CURSOR.create_user_table()
-    USER_CURSOR.create_friend_table()
+    users = databases.enter_context(db.UserDb(hasher, "res/{}/db/user.db".format(PORT_API), PORT_API, PORT_TCP))
+    users.create_user_table()
+    users.create_friend_table()
     print("[INFO] user.db 创建完毕！")
-    FORUM_CURSOR = db.ForumDb('res/{}/db/forum.db'.format(PORT_API), PORT_API, PORT_TCP)
-    FORUM_CURSOR.create_forum_table()
+    forums = databases.enter_context(db.ForumDb('res/{}/db/forum.db'.format(PORT_API), PORT_API, PORT_TCP))
+    forums.create_forum_table()
     print("[INFO] forum.db 创建完毕！")
     init(PORT_API)
     print("[INFO] file.db 创建完毕！")
-    NOTIFICATION_CURSOR = db.NotificationsDb("res/{}/db/notification.db".format(PORT_API), PORT_API)
+    databases.enter_context(db.NotificationsDb("res/{}/db/notification.db".format(PORT_API), PORT_API))
     print("[INFO] notification.db 创建完毕")
-    TICKETS_CURSOR = db.TicketsDb("res/{}/db/ticket.db".format(PORT_API), PORT_API)
+    databases.enter_context(db.TicketsDb("res/{}/db/ticket.db".format(PORT_API), PORT_API))
     print("[INFO] ticket.db 创建完毕")
-    PUNISHMENTS_CURSOR = db.PunishmentsDb("res/{}/db/punishment.db".format(PORT_API), PORT_API)
+    databases.enter_context(db.PunishmentsDb("res/{}/db/punishment.db".format(PORT_API), PORT_API))
     print("[INFO] punishment.db 创建完毕")
-    GROUP_CURSOR = db.GroupDb("res/{}/db/group.db".format(PORT_API), PORT_API)
-    GROUP_CURSOR.create_group_table()
+    groups = databases.enter_context(db.GroupDb("res/{}/db/group.db".format(PORT_API), PORT_API))
+    groups.create_group_table()
     print("[INFO] group.db 创建完毕")
     
 
-    root_username = input("输入 root 用户的用户名：")
-    root_password = input("输入 root 用户的密码：")
-    USER_CURSOR.user_create(root_username, root_password, time.time())
-    USER_CURSOR.change_auth(0, "root")
-    NOTIFICATION_CURSOR.create_user_table(0)
-
+    _create_initial_root(users)
     advanced_setup(cfg)
 
 def _ask_bool(prompt, default=False):
@@ -318,7 +369,7 @@ def advanced_setup(cfg):
             cfg["db_host"] = input("MySQL 主机地址 [localhost]：").strip() or "localhost"
             cfg["db_port"] = _ask_int("MySQL 端口", 3306)
             cfg["db_user"] = input("MySQL 用户名：").strip()
-            cfg["db_password"] = input("MySQL 密码：").strip()
+            cfg["db_password"] = input("MySQL 密码：")
             cfg["db_name"] = input("MySQL 数据库名 [touchfish_v5]：").strip() or "touchfish_v5"
             changed = True
         elif choice == "3":
@@ -326,17 +377,39 @@ def advanced_setup(cfg):
             cfg["db_host"] = input("PostgreSQL 主机地址 [localhost]：").strip() or "localhost"
             cfg["db_port"] = _ask_int("PostgreSQL 端口", 5432)
             cfg["db_user"] = input("PostgreSQL 用户名：").strip()
-            cfg["db_password"] = input("PostgreSQL 密码：").strip()
+            cfg["db_password"] = input("PostgreSQL 密码：")
             cfg["db_name"] = input("PostgreSQL 数据库名 [touchfish_v5]：").strip() or "touchfish_v5"
             changed = True
         else:
             cfg["db_backend"] = "sqlite"
 
     if changed:
+        _database_settings(cfg)
         write_json("res/{}/config.json".format(PORT_API), cfg)
         prt("高级配置已保存到 res/{}/config.json".format(PORT_API), "green")
     else:
         prt("未进行高级配置，可稍后在服务器设置中修改。", "yellow")
+
+def _database_settings(config):
+    backend = config.get("db_backend", "sqlite")
+    if backend == "sqlite":
+        return SQLiteDialect(), None
+    if backend not in ("mysql", "postgresql"):
+        raise ValueError("不支持的 db_backend，请检查实例配置。")
+    if (not isinstance(config.get("db_user"), str) or not config["db_user"].strip()
+            or not isinstance(config.get("db_password"), str)):
+        raise ValueError("远程数据库配置需要 db_user 和 db_password，无密码时可填写空字符串。")
+    dialect, default_port = ((MySQLDialect(), 3306) if backend == "mysql"
+                             else (PostgreSQLDialect(), 5432))
+    port = config.get("db_port", default_port)
+    if type(port) not in (int, str) or not 0 < int(port) <= 65535:
+        raise ValueError("远程数据库端口无效。")
+    return dialect, {
+        "host": config.get("db_host", "localhost"), "port": int(port),
+        "user": config["db_user"], "password": config["db_password"],
+        "database": config.get("db_name", "touchfish_v5"),
+    }
+
 
 def flask_thread():
     if USE_DEV_SERVER:
@@ -395,13 +468,17 @@ def main(args=None):
     server_lst = None
     cnt = 0
     try:
-        with open("server_config.json", "r+") as file:
+        with open("server_config.json", encoding="utf-8") as file:
             server_lst = json.load(file)
+        if not isinstance(server_lst, dict):
+            raise ValueError("server_config.json 必须包含服务器配置对象")
         cnt = len(server_lst.keys())
         for keys in server_lst.keys():
             print("[{}] API_PORT: {}, TCP_PORT : {}".format(keys, server_lst[keys][0], server_lst[keys][1]))
         print("[{}] 创建新的服务器".format(cnt))
-    except:
+    except FileNotFoundError as error:
+        if args.use_config is not None:
+            raise ValueError("配置 {} 不存在，请先创建服务器配置。".format(args.use_config)) from error
         prt("未找到初始服务器配置！", "red")
         create_new_server()
         chosen = -1
@@ -432,16 +509,17 @@ def main(args=None):
         sys.exit(1)
     print("服务器在 PORT_API={}, PORT_TCP={} 上部署。".format(PORT_API, PORT_TCP))
 
+    config_path = Path("res") / str(PORT_API) / "config.json"
+    server_cfg = read_json(config_path)
+    if not isinstance(server_cfg, dict):
+        raise ValueError(f"{config_path} 必须包含服务器配置对象。")
+    dialect, db_dsn = _database_settings(server_cfg)
+
     PUB_KEY = load_pub("res/{}/secret/pub.pem".format(PORT_API))
     PRI_KEY = load_pri("res/{}/secret/pri.pem".format(PORT_API))
-    pub_pem = open("res/{}/secret/pub.pem".format(PORT_API), "rb")
-
-    config_path = "res/{}/config.json".format(PORT_API)
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            server_cfg = json.load(f)
-    except Exception:
-        server_cfg = {}
+    if PUB_KEY.public_numbers() != PRI_KEY.public_key().public_numbers():
+        raise ValueError("请求信封公钥和私钥不匹配，请恢复匹配的密钥备份。")
+    pub_pem = Path("res/{}/secret/pub.pem".format(PORT_API)).read_bytes()
 
     # JWT 签名密钥环：与请求信封的 pri.pem/pub.pem 完全独立。
     # 构造时只建目录、不生成密钥；首次以非对称算法签发时才落盘。
@@ -451,34 +529,6 @@ def main(args=None):
             server_cfg.get("jwt_rsa_key_size", 2048)
         ),
     )
-
-    db_backend = server_cfg.get("db_backend", "sqlite")
-    if db_backend in ("mysql", "postgresql"):
-        missing = [k for k in ("db_user", "db_password") if not server_cfg.get(k)]
-        if missing:
-            prt("数据库配置缺失 {}，已回退到 SQLite。".format("、".join(missing)), "yellow")
-            db_backend = "sqlite"
-    if db_backend == "mysql":
-        dialect = MySQLDialect()
-        db_dsn = {
-            "host": server_cfg.get("db_host", "localhost"),
-            "port": server_cfg.get("db_port", 3306),
-            "user": server_cfg["db_user"],
-            "password": server_cfg["db_password"],
-            "database": server_cfg.get("db_name", "touchfish_v5"),
-        }
-    elif db_backend == "postgresql":
-        dialect = PostgreSQLDialect()
-        db_dsn = {
-            "host": server_cfg.get("db_host", "localhost"),
-            "port": server_cfg.get("db_port", 5432),
-            "user": server_cfg["db_user"],
-            "password": server_cfg["db_password"],
-            "database": server_cfg.get("db_name", "touchfish_v5"),
-        }
-    else:
-        dialect = SQLiteDialect()
-        db_dsn = None
 
     if db_dsn is not None:
         USER_CURSOR = db.UserDb(HASHER, db_dsn, PORT_API, PORT_TCP, dialect=dialect)
@@ -512,19 +562,14 @@ def main(args=None):
         )
     if db_dsn is not None and USER_CURSOR.count_users() == 0:
         prt("外部数据库中尚无用户，请创建 root 账户。", "yellow")
-        try:
-            root_username = input("输入 root 用户的用户名：")
-            root_password = input("输入 root 用户的密码：")
-            USER_CURSOR.user_create(root_username, root_password, time.time())
-            USER_CURSOR.change_auth(0, "root")
-            NOTIFICATION_CURSOR.create_user_table(0)
-            prt("root 账户已创建。", "green")
-        except Exception as e:
-            prt("root 账户创建失败: {}".format(e), "red")
+        _create_initial_root(USER_CURSOR)
+        prt("root 账户已就绪。", "green")
 
     FILE_CURSOR.reconcile_references(
         MESSAGES_CURSOR.get_file_reference_rows() +
-        FORUM_CURSOR.get_file_reference_rows()
+        FORUM_CURSOR.get_file_reference_rows(),
+        # Ignore recent references that may still belong to an in-flight write.
+        stale_message_reference_cutoff=time.time() - 3600,
     )
     # 回填旧数据中 size 为 0/NULL 的文件大小
     # （OSS2 模式下本地无文件，从 OSS head_object 获取；本地模式下从磁盘获取）
@@ -712,4 +757,4 @@ if __name__ == '__main__':
                 except Exception: pass
         prt(e, "red")
         prt("运行或操作错误，程序终止", "red")
-        exit()
+        raise SystemExit(1)

@@ -14,6 +14,7 @@ import functools
 
 from flask import request
 from jwt_tool import LEGACY_NOTE
+from json_store import restrict_private_file
 from error_codes import legacy_failure_body, normalize_error
 
 def load_pri(path : str):
@@ -21,6 +22,7 @@ def load_pri(path : str):
     返回私钥对象
     """
     with open(path, "rb") as key_file:
+        restrict_private_file(key_file)
         private_key = serialization.load_pem_private_key(
             key_file.read(),
             password=None,
@@ -54,22 +56,22 @@ def return_app_route(app,  pri, auth_resolver=None, feature_checker=None):
         路由可用 @api(path, feature=("forum",)) 声明所属功能；关闭时直接
         返回 {"error": "feature_disabled_<path>"}
     """
-    def res(*args, feature=None, **kwargs):
+    def res(*args, feature=None, resolve_identity=True, **kwargs):
         """
         和 @app.route 一样，传入 path 与 methods
         """
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*wrapper_args, **wrapper_kwargs):
-                req_data = request.get_json()
+                req_data = request.get_json(cache=False)
                 try:
-                    aes_key, iv_bytes, content = deal_req_data(req_data, pri)
-                    content = json.loads(json.dumps(content))
+                    aes_key, _, content = deal_req_data(req_data, pri)
+                    del req_data
                     detailed = content.get("detail_error") is True
                     if (feature is not None and feature_checker is not None
                             and not feature_checker(feature)):
                         ret = {"error": "feature_disabled_" + "_".join(feature)}
-                    elif auth_resolver is not None:
+                    elif resolve_identity and auth_resolver is not None:
                         ok, resolved = auth_resolver(content)
                         if not ok:
                             ret = resolved
@@ -89,7 +91,7 @@ def return_app_route(app,  pri, auth_resolver=None, feature_checker=None):
                         ret, tuple_status = ret
                         if detailed:
                             ret_status = tuple_status
-                    if isinstance(ret, str):
+                    if isinstance(ret, str) and not ret.lstrip().startswith("["):
                         try:
                             ret = json.loads(ret)
                         except (TypeError, json.JSONDecodeError):
@@ -100,19 +102,16 @@ def return_app_route(app,  pri, auth_resolver=None, feature_checker=None):
                     else:
                         ret = legacy_failure_body(ret)
                     if not isinstance(ret, str):
-                        ret = json.dumps(ret)
-                    iv, ret = aes_encrypt(ret, aes_key)
+                        ret = json.dumps(ret, ensure_ascii=False, separators=(",", ":"))
+                    iv, ret = aes_encrypt(ret.encode("utf-8", errors="backslashreplace"), aes_key)
                     iv = base64.b64encode(iv).decode("utf-8")
                     ret = base64.b64encode(ret).decode("utf-8")
                     return {"iv" : iv, "content" : ret}, ret_status
-                except Exception as e:
-                    print("[ERR] 来自客户端错误访问导致的异常：{}".format(e))
-                    aes_key = ""
-                    iv_bytes = ""
-                    content = {}
-                    if not content:
-                        return "Wrong Requests!" 
-                        
+                except Exception as error:
+                    # Handler exceptions may include credentials or decoded user input.
+                    app.logger.debug("Encrypted request failed (%s)", type(error).__name__)
+                    return "Wrong Requests!"
+
             return app.route(*args, **kwargs)(wrapper)
 
         return decorator
@@ -124,17 +123,18 @@ def deal_req_data(data : dict, pri):
     """
     data 是所传数据，pri 是加密的
     """
-    try:
-        orginal_key_bytes = base64.b64decode(data["key"])
-        iv_bytes = base64.b64decode(data["iv"])
-        content = base64.b64decode(data["content"])
-        aes_key = decrypt(pri, orginal_key_bytes)
-        content = aes_decrypt(iv_bytes, content, aes_key)
-        content = json.loads(content)
-        return aes_key, iv_bytes, content
-    except Exception as e:
-        return {}
-    
+    encrypted_key = base64.b64decode(data["key"])
+    iv = base64.b64decode(data["iv"])
+    if len(iv) != 16 or len(encrypted_key) != (pri.key_size + 7) // 8:
+        raise ValueError("Invalid request envelope")
+    ciphertext = base64.b64decode(data["content"])
+    if not ciphertext or len(ciphertext) % 16:
+        raise ValueError("Invalid request envelope")
+    key = decrypt(pri, encrypted_key)
+    content = json.loads(aes_decrypt(iv, ciphertext, key))
+    if not isinstance(content, dict):
+        raise ValueError("Expected a request object")
+    return key, iv, content
 
 
 def sha256(data : str | bytes) -> str:

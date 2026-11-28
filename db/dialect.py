@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import threading
 from abc import ABC, abstractmethod
+from functools import lru_cache
 
 
 
@@ -19,7 +20,6 @@ class CursorProxy:
         self._cursor = real_cursor
         self._dialect = dialect
         self._connection = connection
-        self._last_sql = ""
         self._last_rowcount = 0
         self._last_sql_upper = ""
 
@@ -27,7 +27,8 @@ class CursorProxy:
         return self._cursor.fetchone()
 
     def fetchall(self):
-        return self._cursor.fetchall()
+        rows = self._cursor.fetchall()
+        return rows if isinstance(rows, list) else list(rows)
 
     def fetchmany(self, size=None):
         return self._cursor.fetchmany(size) if size is not None else self._cursor.fetchmany()
@@ -55,10 +56,7 @@ class CursorProxy:
         return getattr(self._cursor, name)
 
     def execute(self, sql: str, params=None):
-        self._dialect._learn_schema(sql)
-        translated = self._dialect.translate_sql(sql)
-        self._last_sql = sql
-        self._last_sql_upper = sql.upper()
+        translated, self._last_sql_upper = self._dialect.prepare_sql(sql)
         try:
             if params is not None:
                 self._cursor.execute(translated, params)
@@ -73,10 +71,7 @@ class CursorProxy:
         return self
 
     def executemany(self, sql: str, params_list):
-        self._dialect._learn_schema(sql)
-        translated = self._dialect.translate_sql(sql)
-        self._last_sql = sql
-        self._last_sql_upper = sql.upper()
+        translated, self._last_sql_upper = self._dialect.prepare_sql(sql)
         try:
             self._cursor.executemany(translated, params_list)
         except Exception as e:
@@ -93,6 +88,8 @@ class SQLDialect(ABC):
 
     placeholder: str = "?"
     paramstyle: str = "qmark"
+    supports_returning = False
+    identifier_quote: str = '"'
 
     retryable_error_types: tuple = ()
     # 可重试的错误码（MySQL errno / PostgreSQL SQLSTATE）与消息片段（SQLite 没码！（当然不是骂SQLITE）
@@ -111,6 +108,23 @@ class SQLDialect(ABC):
         self.table_auto_pk_map = {}
         self._schema_lock = threading.Lock()
         self._known_tables: set[str] = set()
+        # Prepared text depends on this dialect instance's learned schema.
+        self._translation_lock = threading.Lock()
+        self._cached_statement = lru_cache(maxsize=256)(self._compile_statement)
+
+    def _compile_statement(self, sql):
+        return self.translate_sql(sql), sql.upper()
+
+    def prepare_sql(self, sql):
+        with self._translation_lock:
+            if sql.lstrip()[:6].upper() == "CREATE":
+                self._learn_schema(sql)
+                self._cached_statement.cache_clear()
+                return self._compile_statement(sql)
+            # Bound retained bytes as well as entry count for generated IN lists.
+            if len(sql) > 8192:
+                return self._compile_statement(sql)
+            return self._cached_statement(sql)
 
     @abstractmethod
     def connect(self, dsn):
@@ -255,6 +269,7 @@ class SQLiteDialect(SQLDialect):
     def __init__(self):
         super().__init__()
         import sqlite3
+        self.supports_returning = sqlite3.sqlite_version_info >= (3, 35)
         self.retryable_error_types = (sqlite3.OperationalError,)
         # 只有这些消息值得重试；schema 错误（no such table 等）应当立刻暴露
         self.retryable_error_hints = (
@@ -275,6 +290,11 @@ class SQLiteDialect(SQLDialect):
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    def prepare_sql(self, sql):
+        if sql.lstrip()[:6].upper() == "CREATE":
+            self._learn_schema(sql)
+        return sql, ""
+
     def translate_sql(self, sql: str) -> str:
         """SQLite: no translation needed."""
         return sql
@@ -283,6 +303,7 @@ class SQLiteDialect(SQLDialect):
 class MySQLDialect(SQLDialect):
     placeholder = "%s"
     paramstyle = "format"
+    identifier_quote = "`"
 
     # MySQL 额外支持反引号标识符与 `#` 行注释，`--` 必须后跟空白才算注释，
     # 字符串默认走反斜杠转义（NO_BACKSLASH_ESCAPES 未开启时）
@@ -294,6 +315,7 @@ class MySQLDialect(SQLDialect):
     def __init__(self):
         super().__init__()
         self._table_text_columns = {}
+        self._upsert_row_alias = True
         # 死锁 / 锁等待超时 / 连接断开 / 连接数打满 / 服务端正在关闭
         self.retryable_error_codes = (1205, 1213, 2006, 2013, 1040, 1053)
         try:
@@ -353,13 +375,20 @@ class MySQLDialect(SQLDialect):
         with conn.cursor() as c:
             c.execute("SELECT VERSION()")
             ver = c.fetchone()[0]
-        major = int(ver.split(".")[0])
-        if major < 8:
+        version = tuple(map(int, re.match(r"(\d+)\.(\d+)\.(\d+)", ver).groups()))
+        if version[0] < 8:
             conn.close()
             raise RuntimeError("TouchFish V5 需要 MySQL 8.0 或更高版本。")
+        with self._translation_lock:
+            row_alias = version >= (8, 0, 19)
+            if self._upsert_row_alias != row_alias:
+                self._upsert_row_alias = row_alias
+                self._cached_statement.cache_clear()
         return conn
 
     def translate_sql(self, sql: str) -> str:
+        # Escape before scanning placeholders so the closing quote stays visible.
+        sql = sql.replace("ESCAPE '\\'", "ESCAPE '\\\\'")
         sql = self._placeholderize(sql)
         sql = self._translate_keyed_text_columns(sql)
 
@@ -385,13 +414,13 @@ class MySQLDialect(SQLDialect):
         # ON CONFLICT(x) DO UPDATE SET c = EXCLUDED.c → AS new ON DUPLICATE KEY UPDATE c = new.c
         sql = re.sub(
             r'\)\s*\bON\s+CONFLICT\s*\([^)]*\)\s*DO\s+UPDATE\s+SET\b',
-            ') AS new ON DUPLICATE KEY UPDATE',
+            ') AS new ON DUPLICATE KEY UPDATE' if self._upsert_row_alias else ') ON DUPLICATE KEY UPDATE',
             sql,
             flags=re.IGNORECASE,
         )
         sql = re.sub(
             r'\bEXCLUDED\.(\w+)',
-            r'new.\1',
+            r'new.\1' if self._upsert_row_alias else r'VALUES(\1)',
             sql,
             flags=re.IGNORECASE,
         )
@@ -458,8 +487,6 @@ class MySQLDialect(SQLDialect):
                 flags=re.IGNORECASE,
             )
 
-        # MySQL \ is a string escape char; double backslash in ESCAPE clause
-        sql = sql.replace("ESCAPE '\\'", "ESCAPE '\\\\'")
 
         # Backtick known table names that may be MySQL reserved words (e.g. `groups`)
         for table in sorted(self._known_tables, key=len, reverse=True):
@@ -619,6 +646,7 @@ class MySQLDialect(SQLDialect):
 
 
 class PostgreSQLDialect(SQLDialect):
+    supports_returning = True
     placeholder = "%s"
     paramstyle = "format"
 
@@ -713,6 +741,8 @@ class PostgreSQLDialect(SQLDialect):
         # PG LIKE is case-sensitive by default (SQLite/MySQL default to CI); use ILIKE
         sql = re.sub(r'(?<!I)\bLIKE\b', 'ILIKE', sql, flags=re.IGNORECASE)
 
+        sql = re.sub(r'\bINSTR\s*\(', 'STRPOS(', sql, flags=re.IGNORECASE)
+
         # DDL: strip remaining COLLATE NOCASE (column definitions, constraints)
         sql = re.sub(r'\s+COLLATE\s+NOCASE\b', '', sql, flags=re.IGNORECASE)
 
@@ -742,7 +772,7 @@ class PostgreSQLDialect(SQLDialect):
     def _insert_or_replace_pg(self, sql: str) -> str:
         """INSERT OR REPLACE INTO t(c1,...) VALUES(...)/SELECT... → INSERT ... ON CONFLICT DO UPDATE"""
         m = re.match(
-            r"\bINSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]*)\)",
+            r"\s*INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]*)\)",
             sql,
             re.IGNORECASE | re.DOTALL,
         )
@@ -751,7 +781,7 @@ class PostgreSQLDialect(SQLDialect):
 
         # Try SELECT pattern: INSERT OR REPLACE INTO t(cols) SELECT ...
         m2 = re.match(
-            r"\bINSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*(SELECT\b.+)",
+            r"\s*INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*(SELECT\b.+)",
             sql,
             re.IGNORECASE | re.DOTALL,
         )
@@ -780,13 +810,14 @@ class PostgreSQLDialect(SQLDialect):
     def _insert_or_ignore_pg(self, sql: str) -> str:
         """INSERT OR IGNORE INTO ... → INSERT INTO ... ON CONFLICT DO NOTHING"""
         m = re.match(
-            r"\bINSERT\s+OR\s+IGNORE\s+INTO\s+(\S.+)",
+            r"\s*INSERT\s+OR\s+IGNORE\s+INTO\s+(\S.*)",
             sql,
-            re.IGNORECASE,
+            re.IGNORECASE | re.DOTALL,
         )
         if not m:
             return sql
-        return "INSERT INTO " + m.group(1) + " ON CONFLICT DO NOTHING"
+        statement = m.group(1).rstrip()
+        return "INSERT INTO " + statement.rstrip(";") + " ON CONFLICT DO NOTHING"
 
     def _translate_pragma(self, sql: str) -> str:
         m = re.match(

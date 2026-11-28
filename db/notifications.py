@@ -21,6 +21,8 @@ _TRANSIENT_LIKE_PATTERNS = (
 class NotificationsDb(Db):
     def __init__(self, path: str, port_api: int, dialect=None):
         super().__init__(path, port_api, -1, dialect=dialect)
+        quote = self.dialect.identifier_quote
+        self._meta_key = f"{quote}key{quote}"
         self._ensure_unified_table()
         self._migrate_new_columns()
         self._migrate_legacy_tables()
@@ -38,9 +40,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     kind       INTEGER NOT NULL DEFAULT 0
 )
 """)
-        self.execute("""
+        self.execute(f"""
 CREATE TABLE IF NOT EXISTS notification_meta (
-    key   TEXT PRIMARY KEY,
+    {self._meta_key} VARCHAR(255) PRIMARY KEY,
     value TEXT NOT NULL
 )
 """)
@@ -73,7 +75,7 @@ CREATE TABLE IF NOT EXISTS notification_meta (
         with self.lock:
             def operation():
                 marker = self.cursor.execute(
-                    "SELECT value FROM notification_meta WHERE key = 'v2_migrated'"
+                    f"SELECT value FROM notification_meta WHERE {self._meta_key} = 'v2_migrated'"
                 ).fetchone()
                 if marker:
                     self.conn.commit()
@@ -93,7 +95,7 @@ CREATE TABLE IF NOT EXISTS notification_meta (
                     "UPDATE notifications SET read_at = time_stamp WHERE read_at IS NULL"
                 )
                 self.cursor.execute(
-                    "INSERT OR REPLACE INTO notification_meta(key, value) "
+                    f"INSERT OR REPLACE INTO notification_meta({self._meta_key}, value) "
                     "VALUES ('v2_migrated', '1')"
                 )
                 self.conn.commit()
@@ -131,11 +133,11 @@ CREATE TABLE IF NOT EXISTS notification_meta (
                         continue
                     event = self._deserialize_event(info)
                     to_insert.append(
-                        (uid, ts, self._serialize_event(event), self._event_kind(event))
+                        (uid, ts, self._serialize_event(event), ts, self._event_kind(event))
                     )
                 if to_insert:
                     self.update(
-                        "INSERT INTO notifications (uid, time_stamp, info, kind) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO notifications (uid, time_stamp, info, read_at, kind) VALUES (?, ?, ?, ?, ?)",
                         to_insert,
                     )
 

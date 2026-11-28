@@ -7,6 +7,8 @@ import register_tool
 import captcha_service
 import base64
 import binascii
+from collections import OrderedDict, deque
+from functools import lru_cache
 import os
 import secrets
 import hmac
@@ -14,6 +16,7 @@ import ipaddress
 import re
 from db import *
 from db.group import JOIN_POLICIES
+from db.sticker import StickerQuotaExceeded
 from db.punishments import PUNISHMENT_KINDS
 from db.user import (
     USERS_COL_PUBLIC_EMAIL,
@@ -28,15 +31,15 @@ import announcements
 import jwt_tool
 import jwt_keys
 from crypto import generate_rsa_keys, return_app_route
-from rate_limiter import RateLimiter
-from mention_utils import resolve_mentioned_uids, should_alert, alert_from_preference
+from rate_limiter import RateLimiter, parse_limits
+from mention_utils import resolve_mentioned_uids, should_alert
 import time
 import threading
 from config_utils import get_features, normalize_default_join_targets, feature_gate, merge_features, SETTINGS_SPEC
 from config_utils import DEFAULT_MIN_PASSWORD_LENGTH, password_allowed
 from json_store import read_json, update_json
 from datetime import datetime
-from file_types import IMAGE_TYPES, detect_file_type, is_sticker_type
+from file_types import IMAGE_TYPES, detect_file_type, is_valid_file_hash
 import oss_store
 import external_auth_providers
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
@@ -53,19 +56,27 @@ def check_rate_limit(uid, bucket: str, max_per_window: int,
                      window: float = 10.0) -> bool:
     """按 (uid, bucket) 限流
     """
-    now = time.time()
-    key = (uid, bucket)
+    if max_per_window <= 0:
+        return False
     with _rate_limit_lock:
-        hits = [t for t in _rate_limit_hits.get(key, []) if t > now - window]
+        now = time.monotonic()
+        cutoff = now - window
+        # Each endpoint uses a fixed window. Accepted timestamps also order the
+        # users by their last activity, so expired entries form a prefix.
+        users = _rate_limit_hits.get(bucket)
+        if users is None:
+            users = _rate_limit_hits[bucket] = OrderedDict()
+        while users and next(iter(users.values()))[-1] <= cutoff:
+            users.popitem(last=False)
+        hits = users.get(uid)
+        if hits is None:
+            hits = users[uid] = deque()
+        while hits and hits[0] <= cutoff:
+            hits.popleft()
         if len(hits) >= max_per_window:
-            _rate_limit_hits[key] = hits
             return False
         hits.append(now)
-        _rate_limit_hits[key] = hits
-        if len(_rate_limit_hits) > 4096:
-            for stale in [k for k, v in _rate_limit_hits.items()
-                          if not v or v[-1] < now - window]:
-                _rate_limit_hits.pop(stale, None)
+        users.move_to_end(uid)
         return True
 
 def check_search_rate(uid, max_per_window: int = 20, window: float = 10.0) -> bool:
@@ -84,7 +95,6 @@ def quota_lock(uid):
     except (TypeError, ValueError):
         index = 0
     return _quota_locks[index]
-
 
 # 单条 SQL 的占位符数量有上限（SQLite 默认 32766），公告又是按全量用户扇出的；
 # 不分批的话 `IN (...)` 直接抛错，异常被副作用包装吞掉 —— 一条通知都发不出去。
@@ -148,14 +158,6 @@ def _positive_int(value):
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
-
-
-_HASH_PATTERN = re.compile(r'^[0-9a-fA-F]{8,128}$')
-
-
-def is_valid_file_hash(hashes) -> bool:
-    """校验文件 hash"""
-    return isinstance(hashes, str) and bool(_HASH_PATTERN.match(hashes))
 
 
 def request_body_limit(cfg):
@@ -339,6 +341,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.after_request
     def allow_cross_origin_requests(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = flask_request.headers.get(
@@ -369,7 +372,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
         return decorator
 
-    limiter = RateLimiter(port_api)
+    limiter = RateLimiter()
     manager_auths = {"admin", "root"}
     managed_auths = {"user", "banned", "pending", "admin", "root"}
     # 受限状态：
@@ -515,8 +518,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 stat = None
             if _config_cache is not None and stat is not None and stat == _config_stat:
                 return dict(_config_cache)
-            cfg = read_json(CONFIG_PATH)
-            _config_cache = dict(cfg)
+            try:
+                cfg = read_json(CONFIG_PATH)
+                if not isinstance(cfg, dict):
+                    raise ValueError("server config must be a JSON object")
+            except (OSError, ValueError):
+                if _config_cache is None:
+                    raise
+                return dict(_config_cache)
+            _config_cache = cfg
             _config_stat = stat
             return dict(_config_cache)
 
@@ -1137,31 +1147,23 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return result
 
     def enrich_message_files(records):
-        metadata_cache = {}
+        cached_metadata = lru_cache(maxsize=None)(file_metadata)
         for record in records:
             hashes = record.get("file_hash")
             if hashes:
-                cache_key = (hashes, record.get("sender_uid"))
-                metadata_cache.setdefault(
-                    cache_key, file_metadata(hashes, record.get("sender_uid"))
-                )
-                metadata = metadata_cache[cache_key]
+                metadata = cached_metadata(hashes, record.get("sender_uid"))
                 if metadata and record.get("file_name"):
                     metadata = with_display_file_name(metadata, record["file_name"])
                 record["file"] = metadata
             preview = record.get("quote_preview")
             if preview and preview.get("file_hash"):
                 hashes = preview["file_hash"]
-                cache_key = (hashes, preview.get("sender_uid"))
-                metadata_cache.setdefault(
-                    cache_key, file_metadata(hashes, preview.get("sender_uid"))
-                )
-                preview["file"] = metadata_cache[cache_key]
+                preview["file"] = cached_metadata(hashes, preview.get("sender_uid"))
         return records
 
     def serialize_post_rows(rows):
         attachments = forum_cursor.get_post_attachments([row[1] for row in rows])
-        metadata_cache = {}
+        cached_metadata = lru_cache(maxsize=None)(file_metadata)
         summaries = {}
         if rows:
             try:
@@ -1183,12 +1185,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             post_attachments = []
             for attachment in attachments.get(row[1], []):
                 hashes = attachment["hash"]
-                cache_key = (hashes, row[3])
-                metadata_cache.setdefault(cache_key, file_metadata(hashes, row[3]))
-                metadata = metadata_cache[cache_key]
+                metadata = cached_metadata(hashes, row[3])
                 if metadata:
                     display_name = attachment.get("display_name") or metadata.get("file_name")
-                    metadata = with_display_file_name(metadata, display_name)
+                    metadata = dict(with_display_file_name(metadata, display_name))
                     metadata["position"] = attachment["position"]
                     post_attachments.append(metadata)
             if post_attachments:
@@ -1249,16 +1249,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if sticker_cursor is not None:
             for row in sticker_cursor.get_user_stickers(target_uid):
                 sticker_hash = row[0]
-                if sticker_cursor.delete_user_sticker(target_uid, sticker_hash):
-                    sticker_cursor.delete_sticker_blob_relations(sticker_hash)
-                    if oss_store.is_oss_enabled(port_api):
-                        oss_store.delete_from_oss(port_api, "sticker", sticker_hash)
-                    sticker_disk_path = file.sticker_path(port_api, sticker_hash)
-                    if os.path.isfile(sticker_disk_path):
-                        try:
-                            os.remove(sticker_disk_path)
-                        except OSError:
-                            pass
+                file.delete_sticker_owner(port_api, target_uid, sticker_hash, sticker_cursor)
         group_cursor.remove_user_membership(target_uid)
         deleted_references = forum_cursor.get_file_reference_rows(
             cleanup_uid=target_uid
@@ -1473,7 +1464,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 return "Forbidden", 403
         ip = flask_request.remote_addr
         endpoint = flask_request.path
-        if not limiter.is_allowed(ip, endpoint):
+        route = flask_request.url_rule
+        limiter.configure(cfg.get("rate_limits"))
+        if not limiter.is_allowed(ip, endpoint, route.rule if route else None):
             return "Too Many Requests", 429
 
     @app.route("/get_rsa_pub")
@@ -1529,20 +1522,23 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return _wellknown_response({"error": "server_error"}, status=500)
         return _wellknown_response(document)
 
-    @api("/auth/login", methods=["POST"])
+    @api("/auth/login", methods=["POST"], resolve_identity=False)
     def login(req):
         try:
             uid = req["uid"]
             pwd = req["password"]
-            if req.get("jwt"):
+            wants_jwt = req.get("jwt")
+            if not wants_jwt and not read_config().get("legacy_auth_enabled", True):
+                return {"error": "auth_failed"}
+            account_error = password_login_error(uid, pwd)
+            if account_error is not None:
+                return {"error": account_error}
+            if wants_jwt:
                 device_id = req.get("device_id")
                 device_name = req.get("device_name")
                 platform = req.get("platform", 0)
-                return login_with_jwt(uid, pwd, device_id, device_name, platform)
-            cfg = read_config()
-            if not cfg.get("legacy_auth_enabled", True):
-                return bool_res()[False]
-            return bool_res()[verify_user(uid, pwd)]
+                return create_session_for_user(uid, device_id, device_name, platform)
+            return bool_res()[True]
         except Exception:
             return bool_res()[False]
 
@@ -1559,6 +1555,24 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except Exception:
             return {"error": "auth_failed"}
 
+    def password_login_error(uid, pwd):
+        if not verify_user(uid, pwd):
+            return "auth_failed"
+        row = get_user_row(uid)
+        if row is None:
+            return "auth_failed"
+        # 先清历史遗留的 banned 再判定：旧数据的封禁状态没有对应处罚记录，
+        # 若不在登录入口清理，这些账号既登不进来、也进不到能触发清理的页面。
+        if row[4] == "banned":
+            _sweep_legacy_ban(uid)
+            row = get_user_row(uid)
+            if row is None:
+                return "auth_failed"
+        if _active_ban(uid) is not None or row[4] == "banned":
+            return "account_banned"
+        if row[4] == "pending":
+            return "pending_activation"
+        return None
     def login_with_jwt(uid, pwd, device_id=None, device_name=None, platform=0):
         """
         JWT 登录
@@ -1674,13 +1688,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             refresh_row = user_cursor.uid_query(uid)
             if refresh_row and refresh_row[0][4] == "banned":
                 return {"error": "account_banned"}
+        if not refresh_row:
+            return {"error": "auth_failed"}
+        if refresh_row[0][4] == "pending":
+            return {"error": "pending_activation"}
         auth_version = user_cursor.get_auth_version(uid)
 
         new_refresh_token = secrets.token_hex(32)
-        new_expires = now + refresh_expires
-        if not user_cursor.rotate_session(session_id, refresh_token, new_refresh_token, now, new_expires):
-            return {"error": "auth_failed"}
-
         try:
             token, payload = jwt_tool.issue_token(
                 jwt_secret, uid, auth_version, access_expires, jwt_issuer(),
@@ -1692,7 +1706,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except Exception as error:
             print("[ERR] 签发 JWT 失败: {}".format(error))
             return {"error": "auth_failed"}
-        if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"]):
+        now = time.time()
+        if not user_cursor.rotate_session(
+            session_id, refresh_token, new_refresh_token, now, now + refresh_expires,
+            uid=uid, auth_version=auth_version, access_token=payload,
+        ):
             return {"error": "auth_failed"}
 
         return {
@@ -2222,11 +2240,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if captcha_service.is_third_party(cfg.get("captcha_provider", "image")):
             return {}
         token = register_tool.generate_captcha(port_api, ImgCaptcha, locks['captcha'])
-        file_path = 'res/{}/captcha/{}.png'.format(port_api, token)
-        with open(file_path, "rb") as file:
-            ret_b64 = file.read()
-        ret_b64 = base64.b64encode(ret_b64).decode("utf-8")
-        return {"pic" : ret_b64, "stamp" : token}
+        with open('res/{}/captcha/{}.png'.format(port_api, token), "rb") as captcha_file:
+            ret_b64 = base64.b64encode(captcha_file.read()).decode("utf-8")
+        return {"pic" : ret_b64, "stamp" : token}, {"Cache-Control": "no-store"}
 
     @app.route('/auth/captcha/page')
     def get_captcha_page():
@@ -2241,7 +2257,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         html, _, _ = captcha_service.render_page(provider, site_key)
         if html is None:
             return Response("Captcha provider not configured.", status=400, mimetype="text/plain")
-        return Response(html, mimetype="text/html")
+        return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
     @api("/auth/change_email_verify", methods=['POST'])
     def change_email_verify(req):
@@ -2338,8 +2354,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/register", methods=['POST'])
     def register(req):
-        username = req["username"]
-        password = req["password"]
+        username = req.get("username")
+        password = req.get("password")
         cfg = read_config()
         if not cfg.get("allow_register", True):
             return {"error": "register_disabled"}
@@ -2356,8 +2372,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 if not captcha_service.verify_token(provider, cfg.get("captcha_secret", ""), token):
                     return {"error": "captcha_invalid"}
             else:
-                captcha_stamp = req["captcha_stamp"]
-                captcha_code = req["captcha_code"]
+                captcha_stamp = req.get("captcha_stamp")
+                captcha_code = req.get("captcha_code")
                 captcha_ok, _ = register_tool.verify_captcha(port_api, captcha_stamp, captcha_code, locks['captcha'])
                 if not captcha_ok:
                     # 验证码错误/过期/已消费：该 stamp 已被作废，客户端需刷新后重试
@@ -2387,10 +2403,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @api("/auth/activate", methods=["POST"])
     def activate(req):
-        uid = req["uid"]
-        activate_code = req["activate_code"]
+        uid = req.get("uid")
+        activate_code = req.get("activate_code")
         uid_row = get_user_row(uid)
-        if uid_row is None:
+        if uid_row is None or uid_row[4] == "banned" or _active_ban(uid_row[0]) is not None:
             return bool_res()[False]
         email = uid_row[2]
         if uid_row[4] != "pending":
@@ -2404,14 +2420,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                                              uid=uid, purpose="activate")
         return activated
 
-    @api("/auth/resend_activation", methods=["POST"])
+    @api("/auth/resend_activation", methods=["POST"], resolve_identity=False)
     def resend_activation(req):
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
             return bool_res()[False]
         uid_row = get_user_row(uid)
-        if uid_row is None:
+        if uid_row is None or uid_row[4] == "banned" or _active_ban(uid_row[0]) is not None:
             return bool_res()[False]
         if uid_row[4] == "banned":
             return bool_res()[False]
@@ -2464,6 +2480,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             code = int(activate_code)
         except (TypeError, ValueError):
             return bool_res()[False]
+        if isinstance(activate_code, str) and re.fullmatch(r"[0-9]{6}", activate_code):
+            activate_code = int(activate_code)
         rows = user_cursor.email_query(email)
         if not rows:
             return bool_res()[False]
@@ -2838,8 +2856,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] != 'root':
             return bool_res()[False]
-        new_limits = req.get("rate_limits")
-        if new_limits is not None and not isinstance(new_limits, dict):
+        if "rate_limits" not in req:
+            return bool_res()[False]
+        new_limits = req["rate_limits"]
+        try:
+            parse_limits(new_limits)
+        except ValueError:
             return bool_res()[False]
         def change(cfg):
             if new_limits is None:
@@ -2847,7 +2869,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             else:
                 cfg["rate_limits"] = new_limits
         update_config(change)
-        limiter.reload(port_api)
         return bool_res()[True]
 
     @api("/auth/server_settings/query", methods=['POST'])
@@ -5060,7 +5081,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         - uid, password, filename
         - chunk_index (0-based), chunk_total
         - chunk_data (base64)
-        - file_id (required after first chunk)
+        - file_id (required after first chunk; optionally a lowercase 64-digit
+          hex ID on the first request so that request can be retried)
         - expected_hash (optional SHA256 of full file)
         """
         try:
@@ -5080,7 +5102,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             user_row = get_user_row(uid)
             if user_row is None:
                 return json.dumps({"success": False, "error": "User not found"}, ensure_ascii=False)
-            if user_row[4] == 'banned':
+            if user_row[4] in _BLOCKED_STATS:
                 return json.dumps({"success": False, "error": "User banned"}, ensure_ascii=False)
 
             cfg = read_config()
@@ -5209,7 +5231,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         hashes = req["hash"]
-        if not verify_user(uid, password):
+        if not is_valid_file_hash(hashes) or not verify_user(uid, password):
             return bool_res()[False]
         file_last_time = read_config().get("file_last_time", 72)
         return bool_res()[file.dereference_file(port_api, uid, hashes, file_cursor, file_last_time)]
@@ -5264,7 +5286,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         hashes = req["hash"]
-        if not verify_user(uid, password):
+        if not is_valid_file_hash(hashes) or not verify_user(uid, password):
             return bool_res()[False]
         return bool_res()[file.delete_user_file(port_api, uid, hashes, file_cursor)]
 
@@ -5315,7 +5337,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         hashes = req["hash"]
-        if not verify_user(uid, password):
+        if not is_valid_file_hash(hashes) or not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -5338,6 +5360,38 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         metadata["upload_user_count"] = uploaders[0][0] if uploaders else 0
         return metadata
+
+    def send_blob(kind, hashes, target_path, download_name, as_attachment, mimetype):
+        options = {
+            "download_name": download_name,
+            "as_attachment": as_attachment,
+            "mimetype": mimetype,
+            "max_age": FILE_CACHE_MAX_AGE,
+        }
+        try:
+            return send_file(os.path.abspath(target_path), **options)
+        except FileNotFoundError:
+            pass
+
+        if not oss_store.is_oss_enabled(port_api):
+            return ("", 404)
+        if oss_store.get_download_mode(port_api) == "redirect":
+            url = oss_store.presigned_download_url(port_api, kind, hashes, download_name)
+            if url:
+                return redirect(url, code=307)
+
+        temp_path = oss_store.temp_download_path(port_api, kind, hashes)
+        if not oss_store.download_from_oss(port_api, kind, hashes, temp_path):
+            return ("", 404)
+        try:
+            response = send_file(os.path.abspath(temp_path), **options)
+            # Let Flask close the file before running the cleanup callback.
+            response.direct_passthrough = False
+            response.call_on_close(lambda: oss_store.safe_remove(temp_path))
+            return response
+        except Exception:
+            oss_store.safe_remove(temp_path)
+            raise
 
     @app.route("/file/get_file/<hashes>")
     def get_file(hashes : str):
@@ -5399,40 +5453,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not media["thumb_size"]:
             return ("", 404)
         download_name = "{}.thumb.webp".format(hashes)
-        if oss_store.is_oss_enabled(port_api):
-            if oss_store.get_download_mode(port_api) == "redirect":
-                # 同上：不 response-content-type 覆盖
-                url = oss_store.presigned_download_url(
-                    port_api, "thumb", hashes, download_name)
-                if url:
-                    return redirect(url, code=307)
-            temp_path = oss_store.temp_download_path(port_api, "thumb", hashes)
-            try:
-                if not oss_store.download_from_oss(port_api, "thumb", hashes, temp_path):
-                    return ("", 404)
-                resp = send_file(
-                    temp_path,
-                    download_name=download_name,
-                    as_attachment=False,
-                    mimetype="image/webp",
-                    max_age=FILE_CACHE_MAX_AGE,
-                )
-                @resp.call_on_close
-                def _cleanup_thumb_temp():
-                    oss_store.safe_remove(temp_path)
-                return resp
-            except Exception:
-                oss_store.safe_remove(temp_path)
-                raise
-        target_path = file.thumb_path(port_api, hashes)
-        if not os.path.isfile(target_path):
-            return ("", 404)
-        return send_file(
-            target_path,
-            download_name=download_name,
-            as_attachment=False,
-            mimetype="image/webp",
-            max_age=FILE_CACHE_MAX_AGE,
+        return send_blob(
+            "thumb", hashes, file.thumb_path(port_api, hashes),
+            download_name, False, "image/webp",
         )
 
     @api('/sticker/upload', methods=['POST'])
@@ -5463,20 +5486,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         payload = decode_base64_payload(file_b64, max_sticker_size)
         if payload is None:
             return json.dumps({"success": False, "error": "invalid_base64"}, ensure_ascii=False)
-        if not is_sticker_type(payload, normalized_name):
+        sticker_type = detect_file_type(payload)
+        if sticker_type not in IMAGE_TYPES:
             return json.dumps({"success": False, "error": "unsupported_sticker_type"}, ensure_ascii=False)
         if max_sticker_size != -1 and len(payload) > max_sticker_size:
             return json.dumps({"success": False, "error": "sticker_too_large"}, ensure_ascii=False)
         # 瞬时贴图总大小不得超过 max_sticker_storage_quota（默认 30MB）
         max_sticker_quota = cfg.get("max_sticker_storage_quota", 31457280)
         new_hashes = file.sha256(payload)
-        if max_sticker_quota != -1:
-            if not sticker_cursor.has_active_user_sticker(uid, new_hashes):
-                current_sticker_usage = sticker_cursor.get_user_sticker_used(uid)
-                if current_sticker_usage + len(payload) > max_sticker_quota:
-                    return json.dumps({"success": False, "error": "sticker_storage_quota_exceeded"}, ensure_ascii=False)
         try:
-            hashes = file.upload_sticker(port_api, uid, payload, normalized_name, sticker_cursor, known_hash=new_hashes)
+            hashes = file.upload_sticker(port_api, uid, payload, normalized_name, sticker_cursor,
+                                        known_hash=new_hashes, quota=max_sticker_quota, detected_type=sticker_type)
+        except StickerQuotaExceeded:
+            return json.dumps({"success": False, "error": "sticker_storage_quota_exceeded"}, ensure_ascii=False)
         except Exception:
             return json.dumps({"success": False, "error": "upload_failed"}, ensure_ascii=False)
         info = sticker_cursor.get_sticker_file_info(hashes)
@@ -5510,46 +5532,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
             ".tgs": "application/octet-stream",
         }
-        if oss_store.is_oss_enabled(port_api):
-            if oss_store.get_download_mode(port_api) == "redirect":
-                # 同上：不 response-content-type 覆盖
-                url = oss_store.presigned_download_url(
-                    port_api, "sticker", hashes, download_name,
-                )
-                if url:
-                    return redirect(url, code=307)
-        # OSS2 mode (proxy): download to unique temp file, delete immediately after sending
-        if oss_store.is_oss_enabled(port_api):
-            temp_path = oss_store.temp_download_path(port_api, "sticker", hashes)
-            try:
-                if not oss_store.download_from_oss(port_api, "sticker", hashes, temp_path):
-                    return ("", 404)
-                resp = send_file(
-                    temp_path,
-                    download_name=download_name,
-                    as_attachment=True,
-                    mimetype=mimetype_map.get(ext),
-                    # hash 寻址内容不可变：URL 相同内容不变，一年内缓存无需校验
-                    max_age=FILE_CACHE_MAX_AGE,
-                )
-                @resp.call_on_close
-                def _cleanup_sticker_temp():
-                    oss_store.safe_remove(temp_path)
-                return resp
-            except Exception:
-                oss_store.safe_remove(temp_path)
-                raise
-        if not os.path.isfile(target_path):
-            return ("", 404)
-        return send_file(
-            target_path,
-            download_name=download_name,
-            as_attachment=True,
-            mimetype=mimetype_map.get(ext),
-            # hash 寻址内容不可变：URL 相同内容不变，一年内缓存无需校验
-            max_age=FILE_CACHE_MAX_AGE,
+        return send_blob(
+            "sticker", hashes, target_path, download_name, True, mimetype_map.get(ext),
         )
-    
+
     @api("/announcement/upload_announcement", methods=['POST'], feature=("announcement",))
     def upload_announcement(req):
         uid = req["uid"]
@@ -6547,12 +6533,22 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     file_record = file_cursor.acquire_reference(uid, file_hash)
                 if file_record is None:
                     return json.dumps({"success": False, "error": "file_unavailable"})
+
+            group_members = group_cursor.get_member_uids(group_id) if group_id is not None else []
+            mentioned_uids = (
+                resolve_mentioned_uids(
+                    content, user_cursor, group_members if group_id is not None else [target_uid],
+                    exclude_uid=uid,
+                ) if content_type == "plain" else []
+            )
             msg_record = messages_cursor.add_message(
                 uid, target_uid, content,
                 content_type=content_type, file_hash=file_hash,
                 quote=quote, group_id=group_id, client_mid=client_mid,
                 file_name=file_record["file_name"] if file_record else None,
-                forwarded=forwarded, duration=duration,
+                forwarded=forwarded, duration=duration, mentioned_uids=mentioned_uids,
+                add_file_reference=file_cursor.add_reference if file_hash else None,
+                remove_file_reference=file_cursor.remove_reference if file_hash else None,
             )
 
             if msg_record.get("duplicate"):
@@ -6579,21 +6575,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     "mid": msg_record["mid"], "client_mid": client_mid,
                     "status": "sent", "message": existing,
                 }, ensure_ascii=False)
-
-            if file_hash:
-                file_cursor.add_reference(file_hash, "message", msg_record["mid"], uid)
-
-            if content_type == "plain":
-                group_members = (
-                    group_cursor.get_member_uids(group_id) if group_id else [])
-                allowed_mentions = group_members if group_id else [target_uid]
-                mentioned_uids = resolve_mentioned_uids(
-                    content, user_cursor, allowed_mentions, exclude_uid=uid
-                )
-            else:
-                group_members = []
-                mentioned_uids = []
-            messages_cursor.set_message_mentions(msg_record["mid"], mentioned_uids)
 
             notif = build_notification(
                 "message.{}".format(content_type),
@@ -6624,24 +6605,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 notif["duration"] = duration
 
             if group_id:
-                room_id = "G{}".format(group_id)
-                if not group_members:
-                    group_members = group_cursor.get_member_uids(group_id)
-                # 一条 SQL 取全部成员的房间偏好，避免按成员逐个查询（N+1）
-                pref_map = messages_cursor.get_room_preference_map(
-                    group_members, room_id)
-                pending = []
-                for user in group_members:
-                    user_notif = dict(notif)
-                    user_notif["room_seq"] = msg_record.get("room_seq")
-                    user_notif["mentions_me"] = user in mentioned_uids
-                    user_notif["should_alert"] = (
-                        user != uid
-                        and alert_from_preference(
-                            pref_map.get(user), user, mentioned_uids)
-                    )
-                    pending.append((user, user_notif))
-                instant_contact.push_messages(pending)
+                notif["room_seq"] = msg_record.get("room_seq")
+                instant_contact.push_group_message(group_members, uid, notif)
             else:
                 recv_notif = dict(notif)
                 recv_notif["room_id"] = "U{}".format(uid)
@@ -6671,6 +6636,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "mid": msg_record["mid"], "client_mid": client_mid,
                 "status": "sent", "message": response_message,
             }, ensure_ascii=False)
+        except FileReferenceUnavailable:
+            return json.dumps({"success": False, "error": "file_unavailable"})
         except Exception:
             return json.dumps({"success": False, "error": "unavailable"})
 
@@ -6804,14 +6771,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             notif["mentioned_uids"] = []
 
             if group_id:
-                pending = []
-                for user in group_cursor.get_member_uids(group_id):
-                    user_notif = dict(notif)
-                    user_notif["room_seq"] = msg_record.get("room_seq")
-                    user_notif["mentions_me"] = False
-                    user_notif["should_alert"] = user != uid
-                    pending.append((user, user_notif))
-                instant_contact.push_messages(pending)
+                notif["room_seq"] = msg_record.get("room_seq")
+                instant_contact.push_group_message(
+                    group_cursor.get_member_uids(group_id), uid, notif, respect_preferences=False)
             else:
                 recv_notif = dict(notif)
                 recv_notif["room_id"] = "U{}".format(uid)
@@ -7122,7 +7084,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ),
         }
         if recalled["group_id"] is not None:
-            recipients = group_cursor.get_member_uids(recalled["group_id"])
+            instant_contact.push_group_recall(group_cursor.get_member_uids(recalled["group_id"]), event)
         else:
             recipients = {recalled["sender_uid"], recalled["receiver_uid"]}
             for recipient in recipients:
@@ -7132,9 +7094,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 direct_event = dict(event)
                 direct_event["room_id"] = "U{}".format(other_uid)
                 instant_contact.push_recall(recipient, direct_event)
-            recipients = []
-        for recipient in recipients:
-            instant_contact.push_recall(recipient, event)
         return json.dumps({
             "success": True,
             "message": recalled,
@@ -7204,7 +7163,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         rows = messages_cursor.query_history(uid, target_uid,
             before_mid=before_mid, limit=limit, group_id=group_id)
         records = messages_cursor.serialize_rows(rows)
-        return json.dumps(enrich_message_files(records), ensure_ascii=False)
+        return enrich_message_files(records)
 
     @api("/message/search", methods=['POST'])
     def message_search(req):

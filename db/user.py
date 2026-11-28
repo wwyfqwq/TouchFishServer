@@ -10,6 +10,7 @@ import time
 email_regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
 ALLOWED_USER_STATS = {"user", "banned", "admin", "root"}
 _UNSET = object()
+_INSERT_TOKEN = "INSERT INTO tokens (jti, uid, issued_at, expires_at, ip, ua) VALUES (?, ?, ?, ?, ?, ?)"
 
 USERS_COL_PUBLIC_EMAIL = 9
 USERS_COL_SHOW_READ_STATUS = 10
@@ -45,7 +46,7 @@ class UserDb(Db):
 
         return False
 
-    def user_create(self, username, password, create_time, email=None, stat='user'):
+    def user_create(self, username, password, create_time, email=None, stat='user', *, only_if_empty=False):
         """
         创建新的用户
         需注意用户名、邮箱不能重复，且长度不超过 20，不少于 4
@@ -61,6 +62,8 @@ class UserDb(Db):
             return False
         if not isinstance(username, str) or len(username) > 20 or len(username) < 4 or " " in username:
             return False
+        if email is not None and not isinstance(email, str):
+            return False
         if email and not re.fullmatch(email_regex, email):
             return False
 
@@ -68,10 +71,6 @@ class UserDb(Db):
         try:
             with self.lock:
                 def operation():
-                    if not self._validate_username_locked(username):
-                        return False
-                    if email and not self._validate_email_locked(email):
-                        return False
                     self.cursor.execute(
                         "UPDATE uid_sequence SET next_uid = next_uid + 1 "
                         "WHERE id = 1"
@@ -88,6 +87,17 @@ class UserDb(Db):
                         self.cursor.execute(
                             "SELECT next_uid FROM uid_sequence WHERE id = 1")
                         uid = int(self.cursor.fetchone()[0]) - 1
+                    # Acquire the sequence row before opening a read snapshot. Competing
+                    # bootstraps and registrations then see the preceding committed user.
+                    if only_if_empty:
+                        self.cursor.execute("SELECT 1 FROM users LIMIT 1")
+                        if self.cursor.fetchone() is not None:
+                            self.conn.rollback()
+                            return False
+                    if (not self._validate_username_locked(username)
+                            or (email and not self._validate_email_locked(email))):
+                        self.conn.rollback()
+                        return False
                     if email:
                         self.cursor.execute(
                             "INSERT INTO users (uid, username, pwd_hash, create_time, email, stat, public_email) VALUES (?, ?, ?, ?, ?, ?, 0)",
@@ -188,7 +198,7 @@ class UserDb(Db):
         return False
 
     def _validate_email_locked(self, email : str, current_uid=None):
-        if not re.fullmatch(email_regex, email):
+        if not isinstance(email, str) or not re.fullmatch(email_regex, email):
             return False
 
         existed = self._fetchone_locked("SELECT uid FROM users WHERE email = ?", (email,))
@@ -268,7 +278,7 @@ class UserDb(Db):
         return self.query(command + " LIMIT ? OFFSET ?", (int(limit), int(offset)))
 
     def validate_email(self, email : str, current_uid=None):
-        if not re.fullmatch(email_regex, email):
+        if not isinstance(email, str) or not re.fullmatch(email_regex, email):
             return False
 
         existed = self.email_query(email)
@@ -496,15 +506,32 @@ class UserDb(Db):
             params.append(uid)
         return bool(self.query(query, tuple(params)))
 
-    def rotate_session(self, session_id, old_refresh_token, new_refresh_token, now, expires_at):
+    def rotate_session(self, session_id, old_refresh_token, new_refresh_token, now, expires_at, *,
+                       uid, auth_version, access_token):
         old_hash = self.hash_refresh_token(old_refresh_token)
         new_hash = self.hash_refresh_token(new_refresh_token)
+
+        def operation():
+            with self.lock:
+                self.cursor.execute(
+                    """UPDATE auth_sessions SET refresh_hash = ?, last_seen_at = ?, expires_at = ?,
+                       session_version = session_version + 1
+                       WHERE session_id = ? AND uid = ? AND refresh_hash = ?
+                         AND revoked_at IS NULL AND expires_at > ?
+                         AND EXISTS (SELECT 1 FROM users WHERE uid = ? AND COALESCE(auth_version, 0) = ?)""",
+                    (new_hash, now, expires_at, session_id, uid, old_hash, now, uid, auth_version),
+                )
+                rotated = self.cursor.rowcount == 1
+                if rotated:
+                    self.cursor.execute(
+                        _INSERT_TOKEN,
+                        (access_token["jti"], uid, access_token["iat"], access_token["exp"], None, None),
+                    )
+                self.conn.commit()
+                return rotated
+
         try:
-            self.execute(
-                "UPDATE auth_sessions SET refresh_hash = ?, last_seen_at = ?, expires_at = ?, session_version = session_version + 1 WHERE session_id = ? AND refresh_hash = ? AND revoked_at IS NULL AND expires_at > ?",
-                (new_hash, now, expires_at, session_id, old_hash, now),
-            )
-            return self.cursor.rowcount == 1
+            return self._execute_with_retry(operation)
         except Exception as e:
             print(e)
             return False
@@ -730,7 +757,7 @@ class UserDb(Db):
         """登记已签发的 JWT（对了，要记录 REDAgent.exe 和 IP）"""
         try:
             self.execute(
-                "INSERT INTO tokens (jti, uid, issued_at, expires_at, ip, ua) VALUES (?, ?, ?, ?, ?, ?)",
+                _INSERT_TOKEN,
                 (jti, uid, issued_at, expires_at, ip, ua),
             )
             return True
@@ -1117,6 +1144,19 @@ class UserDb(Db):
 
     def change_auth(self, oped : int, new_auth : str):
         self.execute("UPDATE users SET stat = ? where uid = ?", (new_auth, oped))
+
+    def activate_pending_user(self, uid: int, email: str) -> bool:
+        def operation():
+            with self.lock:
+                self.cursor.execute(
+                    "UPDATE users SET stat = 'user' WHERE uid = ? AND email = ? AND stat = 'pending'",
+                    (uid, email),
+                )
+                activated = self.cursor.rowcount > 0
+                self.conn.commit()
+                return activated
+
+        return self._execute_with_retry(operation)
     
     def change_email(self, oped : int, new_email : str):
         if not self.validate_email(new_email, oped):

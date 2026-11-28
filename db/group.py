@@ -83,11 +83,22 @@ class GroupDb(Db):
             )
         """)
         self.execute("""
-            INSERT OR IGNORE INTO group_id_sequence(id)
-            SELECT MAX(gid) FROM groups
-            WHERE EXISTS(SELECT 1 FROM groups)
-              AND NOT EXISTS(SELECT 1 FROM group_id_sequence)
+            CREATE TABLE IF NOT EXISTS group_id_counter (
+                id INTEGER PRIMARY KEY,
+                next_gid INTEGER NOT NULL
+            )
         """)
+        # Preserve IDs consumed by older versions, including deleted groups.
+        next_gid = self.query("""
+            SELECT MAX(last_id) + 1 FROM (
+                SELECT COALESCE(MAX(gid), 0) AS last_id FROM groups
+                UNION ALL SELECT COALESCE(MAX(id), 0) FROM group_id_sequence
+            ) AS existing_ids
+        """)[0][0]
+        self.execute("INSERT OR IGNORE INTO group_id_counter (id, next_gid) VALUES (1, ?)",
+                     (next_gid,))
+        self.execute("UPDATE group_id_counter SET next_gid = ? WHERE id = 1 AND next_gid < ?",
+                     (next_gid, next_gid))
         self._migrate()
 
     def _parse_essence(self, raw) -> list:
@@ -105,9 +116,11 @@ class GroupDb(Db):
                 self.cursor.execute("SELECT essence FROM groups WHERE gid = ?", (gid,))
                 row = self.cursor.fetchone()
                 if not row:
+                    self.conn.commit()
                     return False
                 essence_list = self._parse_essence(row[0])
                 if mid in essence_list:
+                    self.conn.commit()
                     return False
                 essence_list.append(mid)
                 essence_list.sort(reverse=True)
@@ -122,9 +135,11 @@ class GroupDb(Db):
                 self.cursor.execute("SELECT essence FROM groups WHERE gid = ?", (gid,))
                 row = self.cursor.fetchone()
                 if not row:
+                    self.conn.commit()
                     return False
                 essence_list = self._parse_essence(row[0])
                 if mid not in essence_list:
+                    self.conn.commit()
                     return False
                 essence_list.remove(mid)
                 self.cursor.execute("UPDATE groups SET essence = ? WHERE gid = ?", (json.dumps(essence_list), gid))
@@ -149,10 +164,12 @@ class GroupDb(Db):
                 self.cursor.execute("SELECT essence FROM groups WHERE gid = ?", (gid,))
                 row = self.cursor.fetchone()
                 if not row:
+                    self.conn.commit()
                     return set()
                 essence_list = self._parse_essence(row[0])
                 kept = [m for m in essence_list if m not in targets]
                 if len(kept) == len(essence_list):
+                    self.conn.commit()
                     return set()
                 removed = set(essence_list) - set(kept)
                 self.cursor.execute("UPDATE groups SET essence = ? WHERE gid = ?", (json.dumps(kept), gid))
@@ -228,6 +245,7 @@ class GroupDb(Db):
                     (JOIN_POLICY_MIGRATION,),
                 )
                 if self.cursor.fetchone() is not None:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     "SELECT gid, allow_direct_join, require_review FROM groups"
@@ -262,6 +280,7 @@ class GroupDb(Db):
                     (GROUP_MEMBERS_MIGRATION,),
                 )
                 if self.cursor.fetchone() is not None:
+                    self.conn.commit()
                     return False
 
                 self.cursor.execute("SELECT gid, creater, members, admins FROM groups")
@@ -417,6 +436,17 @@ class GroupDb(Db):
         )
         return [row[0] for row in rows]
 
+    def get_member_uids_for_sender(self, gid: int, sender_uid: int) -> list:
+        """Take one snapshot of authorized recipients; fanout needs no join-time sort."""
+        rows = self.query(
+            """SELECT target.uid FROM groups g
+               JOIN group_members actor ON actor.gid = g.gid AND actor.uid = ?
+               JOIN group_members target ON target.gid = g.gid
+               WHERE g.gid = ?""",
+            (sender_uid, gid),
+        )
+        return [row[0] for row in rows]
+
     def get_admin_uids(self, gid: int) -> list:
         rows = self.query(
             "SELECT uid FROM group_members WHERE gid = ? AND role = 1 ORDER BY join_time ASC, uid ASC",
@@ -517,11 +547,13 @@ class GroupDb(Db):
 
         with self.lock:
             def operation():
+                self.cursor.execute("UPDATE group_id_counter SET next_gid = next_gid + 1 WHERE id = 1")
                 self.cursor.execute("SELECT COUNT(*) FROM groups WHERE creater = ?", (creater,))
                 if limit != -1 and self.cursor.fetchone()[0] >= limit:
+                    self.conn.rollback()
                     return 0
-                self.cursor.execute("INSERT INTO group_id_sequence DEFAULT VALUES")
-                gid = self.cursor.lastrowid
+                self.cursor.execute("SELECT next_gid FROM group_id_counter WHERE id = 1")
+                gid = self.cursor.fetchone()[0] - 1
                 self.cursor.execute(
                     """INSERT INTO groups (gid, creater, groupname,
                        enter_hint, introduction, allow_direct_join, require_review,
@@ -559,15 +591,18 @@ class GroupDb(Db):
             def operation():
                 self.cursor.execute("SELECT 1 FROM groups WHERE gid = ?", (gid,))
                 if self.cursor.fetchone() is None:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     "SELECT 1 FROM group_members WHERE gid = ? AND uid = ?",
                     (gid, new_member),
                 )
                 if self.cursor.fetchone() is not None:
+                    self.conn.commit()
                     return False
                 self.cursor.execute("SELECT COUNT(*) FROM group_members WHERE gid = ?", (gid,))
                 if limit != -1 and self.cursor.fetchone()[0] >= limit:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     "INSERT INTO group_members (gid, uid, role, join_time) VALUES (?, ?, 0, ?)",
@@ -623,12 +658,14 @@ class GroupDb(Db):
                 self.cursor.execute("SELECT creater FROM groups WHERE gid = ?", (gid,))
                 group = self.cursor.fetchone()
                 if not group or group[0] != old_owner:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     "SELECT role FROM group_members WHERE gid = ? AND uid = ?",
                     (gid, new_owner),
                 )
                 if self.cursor.fetchone() is None:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     "UPDATE group_members SET role = 1 WHERE gid = ? AND uid = ?",
@@ -726,6 +763,7 @@ class GroupDb(Db):
                 )
                 request = self.cursor.fetchone()
                 if not request or request[2] != 'pending':
+                    self.conn.commit()
                     return False
                 gid, uid = request[0], request[1]
                 if not approved:
@@ -738,15 +776,18 @@ class GroupDb(Db):
 
                 self.cursor.execute("SELECT 1 FROM groups WHERE gid = ?", (gid,))
                 if self.cursor.fetchone() is None:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     "SELECT 1 FROM group_members WHERE gid = ? AND uid = ?",
                     (gid, uid),
                 )
                 if self.cursor.fetchone() is not None:
+                    self.conn.commit()
                     return False
                 self.cursor.execute("SELECT COUNT(*) FROM group_members WHERE gid = ?", (gid,))
                 if limit != -1 and self.cursor.fetchone()[0] >= limit:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     "INSERT INTO group_members (gid, uid, role, join_time) VALUES (?, ?, 0, ?)",

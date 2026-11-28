@@ -17,22 +17,44 @@ from __future__ import annotations
 
 """
 
-import json
+import math
+import logging
 import time
 import threading
-from collections import defaultdict
+from collections import deque
+
+
+def parse_limits(raw):
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("rate_limits must be an object")
+    limits = {}
+    for endpoint, rule in raw.items():
+        if endpoint != "default" and not (isinstance(endpoint, str) and endpoint.startswith("/")):
+            raise ValueError("invalid endpoint in rate_limits")
+        if not isinstance(rule, dict):
+            raise ValueError(f"{endpoint}: expected a rate limit object")
+        requests = rule.get("requests")
+        window = rule.get("range")
+        if type(requests) is not int or requests < 0:
+            raise ValueError(f"{endpoint}: requests must be a nonnegative integer")
+        try:
+            window = float(window) if not isinstance(window, bool) else 0
+        except (TypeError, ValueError, OverflowError):
+            window = 0
+        if not math.isfinite(window) or window <= 0:
+            raise ValueError(f"{endpoint}: range must be positive and finite")
+        limits[endpoint] = (requests, window)
+    return limits
 
 
 class RateLimiter:
-    def __init__(self, port_api: int):
+    def __init__(self):
         self._lock = threading.Lock()
-        self._requests: dict = defaultdict(list)
-        try:
-            with open("res/{}/config.json".format(port_api), "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            self._limits: dict = cfg.get("rate_limits", {})
-        except Exception:
-            self._limits = {}
+        self._requests = {}
+        self._limits = {}
+        self._raw_limits = None
         self._start_cleanup()
 
     def _start_cleanup(self):
@@ -45,46 +67,45 @@ class RateLimiter:
 
     def _cleanup(self):
         with self._lock:
-            max_range = max(
-                (v.get("range", 60) for v in self._limits.values()), default=60
-            )
-            cutoff = time.time() - max_range * 2
-            expired = [k for k, v in self._requests.items() if not v or v[-1] < cutoff]
+            max_range = max((window for _, window in self._limits.values()), default=60)
+            cutoff = time.monotonic() - max_range
+            expired = [key for key, hits in self._requests.items() if hits[-1] <= cutoff]
             for k in expired:
                 del self._requests[k]
 
-    def _get_limit_for(self, endpoint: str) -> dict | None:
-        """返回适用的限制规则，优先端点规则，其次 default，无则 None。"""
-        return self._limits.get(endpoint) or self._limits.get("default")
-
-    def reload(self, port_api: int) -> None:
-        """从配置文件加载 ratelimit"""
-        try:
-            with open("res/{}/config.json".format(port_api), "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            new_limits = cfg.get("rate_limits", {})
-        except Exception:
-            return
+    def configure(self, raw_limits):
+        """Reload changed settings, keeping the previous policy on invalid edits."""
         with self._lock:
-            self._limits = new_limits
+            if raw_limits is self._raw_limits:
+                return
+            self._raw_limits = raw_limits
+            try:
+                self._limits = parse_limits(raw_limits)
+            except ValueError as error:
+                logging.getLogger(__name__).warning("Ignoring invalid rate_limits: %s", error)
 
-    def is_allowed(self, ip: str, endpoint: str) -> bool:
-        """
-        判断来自 ip 的对 endpoint 的本次请求是否在速率限制内。
-        """
-        limit = self._get_limit_for(endpoint)
-        if limit is None:
-            return True
-        max_requests: int = limit["requests"]
-        range_: float = float(limit["range"])
-        now = time.time()
-        key = (ip, endpoint)
+    def is_allowed(self, ip: str, endpoint: str, route: str | None) -> bool:
         with self._lock:
-            cutoff = now - range_
-            self._requests[key] = [t for t in self._requests[key] if t > cutoff]
-            if len(self._requests[key]) >= max_requests:
+            # Match overrides by concrete path or route template. The default
+            # stays per path so a page can fetch many different image URLs.
+            bucket = endpoint if endpoint in self._limits else route
+            limit = self._limits.get(bucket)
+            if limit is None:
+                bucket = endpoint if route is not None else "<unmatched>"
+                limit = self._limits.get("default")
+            if limit is None:
+                return True
+            max_requests, window = limit
+            if max_requests == 0:
                 return False
-            self._requests[key].append(now)
+            now = time.monotonic()
+            hits = self._requests.setdefault((ip, bucket), deque())
+            cutoff = now - window
+            while hits and hits[0] <= cutoff:
+                hits.popleft()
+            if len(hits) >= max_requests:
+                return False
+            hits.append(now)
             return True
 
 

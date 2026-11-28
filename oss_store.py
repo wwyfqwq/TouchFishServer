@@ -32,8 +32,7 @@ _config_cache = {}
 _config_cache_ttl = 60.0
 _config_lock = threading.Lock()
 
-_download_locks = {}
-_download_locks_guard = threading.Lock()
+_download_locks = [threading.Lock() for _ in range(64)]
 
 
 def _read_config(port_api: int) -> dict:
@@ -176,16 +175,6 @@ def upload_file_to_oss(port_api: int, local_path: str, kind: str, hashes: str,
         return False
 
 
-def _get_download_lock(kind: str, hashes: str) -> threading.Lock:
-    key = "{}/{}".format(kind, hashes)
-    with _download_locks_guard:
-        lock = _download_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _download_locks[key] = lock
-        return lock
-
-
 def download_from_oss(port_api: int, kind: str, hashes: str, local_path: str, cfg: dict = None) -> bool:
     """从 OSS2 下载对象到本地临时路径。返回是否成功。"""
     if not is_oss_enabled(port_api, cfg):
@@ -194,21 +183,25 @@ def download_from_oss(port_api: int, kind: str, hashes: str, local_path: str, cf
         cfg = _read_config(port_api)
     bucket = _get_bucket(port_api, cfg)
     key = object_key(kind, hashes)
-    lock = _get_download_lock(kind, hashes)
+    lock = _download_locks[hash(os.path.abspath(local_path)) % len(_download_locks)]
     with lock:
         if os.path.isfile(local_path):
             return True
+        staging = "{}.{}.part".format(local_path, uuid.uuid4().hex)
         try:
             if not bucket.object_exists(key):
                 return False
             dirname = os.path.dirname(local_path)
             if dirname:
                 os.makedirs(dirname, exist_ok=True)
-            bucket.get_object_to_file(key, local_path)
+            bucket.get_object_to_file(key, staging)
+            os.replace(staging, local_path)
             return True
         except Exception as e:
             print("[WARN] OSS2 下载失败 ({}): {}".format(key, e))
             return False
+        finally:
+            safe_remove(staging)
 
 
 def get_size_from_oss(port_api: int, kind: str, hashes: str, cfg: dict = None) -> int:

@@ -1,6 +1,11 @@
+from db.dialect import MySQLDialect, PostgreSQLDialect
 from db.tool import Db
 import json
 import time
+
+
+class FileReferenceUnavailable(Exception):
+    """The backing file disappeared before its message could be stored."""
 
 
 class MessagesDb(Db):
@@ -11,9 +16,13 @@ class MessagesDb(Db):
 
     def __init__(self, path: str, port_api: int, dialect=None):
         super().__init__(path, port_api, -1, dialect=dialect)
+        self._implicit_watermark = self._watermark_upsert(genuine=False)
+        self._explicit_watermark = self._watermark_upsert(genuine=True)
         self._create_table()
         self._migrate()
         self._create_indexes()
+        self._refresh_room_sequences()
+        self._backfill_direct_rooms()
 
     @staticmethod
     def room_key_of(sender_uid: int, receiver_uid: int, group_id=None) -> str:
@@ -63,6 +72,25 @@ class MessagesDb(Db):
                 duration INTEGER,
                 room_key TEXT,
                 room_seq INTEGER
+            )
+        """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS room_sequences (
+                room_key TEXT PRIMARY KEY,
+                last_seq INTEGER NOT NULL
+            )
+        """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS direct_rooms (
+                room_key TEXT PRIMARY KEY,
+                low_uid INTEGER NOT NULL,
+                high_uid INTEGER NOT NULL
+            )
+        """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS direct_room_backfill (
+                id INTEGER PRIMARY KEY,
+                last_mid INTEGER NOT NULL
             )
         """)
         self.execute("""
@@ -166,6 +194,8 @@ class MessagesDb(Db):
         except Exception:
             pass
         indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_direct_rooms_low ON direct_rooms(low_uid)",
+            "CREATE INDEX IF NOT EXISTS idx_direct_rooms_high ON direct_rooms(high_uid)",
             """CREATE INDEX IF NOT EXISTS idx_messages_conversation
                ON messages(sender_uid, receiver_uid, send_time DESC)""",
             """CREATE INDEX IF NOT EXISTS idx_messages_receiver
@@ -196,19 +226,19 @@ class MessagesDb(Db):
                      content_type: str = 'plain', file_hash: str = None,
                       quote: int = -1, group_id: int = None,
                        client_mid: str = None, file_name: str = None,
-                        forwarded: int = -1, duration: int = None) -> dict:
+                        forwarded: int = -1, duration: int = None,
+                     mentioned_uids=(), add_file_reference=None,
+                     remove_file_reference=None) -> dict:
         send_time = time.time()
+        mentioned_uids = {int(uid) for uid in mentioned_uids}
         _IntegrityError = self.dialect.IntegrityError
         with self.lock:
             def operation():
                 room_key = self.room_key_of(sender_uid, receiver_uid, group_id)
+                reference_added = False
                 try:
-                    row = self.cursor.execute(
-                        "SELECT MAX(room_seq) FROM messages WHERE room_key = ?",
-                        (room_key,),
-                    ).fetchone()
-                    room_seq = (row[0] + 1) if row and row[0] is not None else 1
-                    self.cursor.execute(
+                    room_seq = self._allocate_room_sequences_locked(room_key)
+                    mid = self._insert_message_locked(
                         """INSERT INTO messages
                            (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
                              file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq)
@@ -216,22 +246,45 @@ class MessagesDb(Db):
                         (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
                           file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq),
                     )
-                    mid = self.cursor.lastrowid
+                    if mentioned_uids:
+                        self.cursor.executemany(
+                            "INSERT INTO message_mentions (mid, uid) VALUES (?, ?)",
+                            [(mid, uid) for uid in mentioned_uids],
+                        )
                     # 发送即已读
                     self._advance_read_watermark_locked(
                         sender_uid, room_key, room_seq, mid, genuine=False)
+                    # Attach the file before exposing the message in history or acknowledging it.
+                    if add_file_reference is not None:
+                        if not add_file_reference(file_hash, "message", mid, sender_uid):
+                            raise FileReferenceUnavailable(file_hash)
+                        reference_added = True
                     self.conn.commit()
                     return mid, room_seq, False
                 except _IntegrityError:
                     self.conn.rollback()
-                    if client_mid:
+                    if reference_added and remove_file_reference is not None:
+                        try:
+                            remove_file_reference(file_hash, "message", mid)
+                        except Exception:
+                            pass
+                    if client_mid is not None:
                         self.cursor.execute(
                             "SELECT mid FROM messages WHERE sender_uid = ? AND client_mid = ?",
                             (sender_uid, client_mid),
                         )
                         existing = self.cursor.fetchone()
+                        self.conn.commit()
                         if existing:
                             return existing[0], None, True
+                    raise
+                except Exception:
+                    self.conn.rollback()
+                    if reference_added and remove_file_reference is not None:
+                        try:
+                            remove_file_reference(file_hash, "message", mid)
+                        except Exception:
+                            pass
                     raise
 
             mid, room_seq, duplicate = self._execute_with_retry(operation)
@@ -258,6 +311,107 @@ class MessagesDb(Db):
             "room_key": self.room_key_of(sender_uid, receiver_uid, group_id),
             "room_seq": room_seq,
         }
+
+    @staticmethod
+    def _direct_room_row(room_key):
+        if not room_key or not room_key.startswith("U"):
+            return None
+        try:
+            low, high = map(int, room_key[1:].split("U"))
+        except ValueError:
+            return None
+        return (room_key, low, high) if low < high else None
+
+    _INSERT_DIRECT_ROOM = (
+        "INSERT OR IGNORE INTO direct_rooms(room_key, low_uid, high_uid) VALUES (?, ?, ?)"
+    )
+
+    def _backfill_direct_rooms(self):
+        # Older releases can add rooms while this release is offline. On restart
+        # inspect only mids written since the previous checkpoint.
+        with self.lock:
+            def operation():
+                previous = self.cursor.execute(
+                    "SELECT last_mid FROM direct_room_backfill WHERE id = 1"
+                ).fetchone()
+                last = previous[0] if previous else 0
+                newest = self.cursor.execute("SELECT MAX(mid) FROM messages").fetchone()[0]
+                if newest is None or last >= newest:
+                    self.conn.commit()
+                    return
+                while last < newest:
+                    page = self.cursor.execute(
+                        "SELECT mid, room_key FROM messages "
+                        "WHERE mid > ? AND mid <= ? ORDER BY mid LIMIT 4096",
+                        (last, newest),
+                    ).fetchall()
+                    keys = {key for _, key in page}
+                    rows = [row for key in keys if (row := self._direct_room_row(key))]
+                    if rows:
+                        self.cursor.executemany(self._INSERT_DIRECT_ROOM, rows)
+                    last = page[-1][0] if page else newest
+                    self.cursor.execute(
+                        "INSERT OR IGNORE INTO direct_room_backfill(id, last_mid) VALUES (1, 0)"
+                    )
+                    self.cursor.execute(
+                        "UPDATE direct_room_backfill SET last_mid = ? WHERE id = 1 AND last_mid < ?",
+                        (last, last),
+                    )
+                    self.conn.commit()
+            self._execute_with_retry(operation)
+
+    def _insert_message_locked(self, sql, params):
+        if isinstance(self.dialect, PostgreSQLDialect):
+            return self.cursor.execute(sql + " RETURNING mid", params).fetchone()[0]
+        self.cursor.execute(sql, params)
+        return self.cursor.lastrowid
+
+    def _advance_room_sequence_locked(self, room_key, count):
+        params = (count, room_key)
+        if isinstance(self.dialect, MySQLDialect):
+            # MySQL returns LAST_INSERT_ID(expr) in the UPDATE response.
+            self.cursor.execute(
+                "UPDATE room_sequences SET last_seq = LAST_INSERT_ID(last_seq + ?) WHERE room_key = ?",
+                params)
+            return self.cursor.lastrowid if self.cursor.rowcount else None
+        advance = "UPDATE room_sequences SET last_seq = last_seq + ? WHERE room_key = ?"
+        if self.dialect.supports_returning:
+            row = self.cursor.execute(advance + " RETURNING last_seq", params).fetchone()
+        else:
+            # Older embedded SQLite builds predate DML RETURNING.
+            self.cursor.execute(advance, params)
+            if not self.cursor.rowcount:
+                return None
+            row = self.cursor.execute(
+                "SELECT last_seq FROM room_sequences WHERE room_key = ?", (room_key,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def _allocate_room_sequences_locked(self, room_key, count=1):
+        """Reserve consecutive sequence numbers in the same transaction as the write."""
+        last = self._advance_room_sequence_locked(room_key, count)
+        if last is None:
+            room = self._direct_room_row(room_key)
+            if room is not None:
+                self.cursor.execute(self._INSERT_DIRECT_ROOM, room)
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO room_sequences (room_key, last_seq) "
+                "SELECT ?, COALESCE(MAX(room_seq), 0) FROM messages WHERE room_key = ?",
+                (room_key, room_key),
+            )
+            last = self._advance_room_sequence_locked(room_key, count)
+        return last - count + 1
+
+    def _refresh_room_sequences(self):
+        # A server downgraded to a version without counters may have written newer rows.
+        self.execute("""
+            UPDATE room_sequences
+               SET last_seq = (SELECT MAX(room_seq) FROM messages
+                                WHERE messages.room_key = room_sequences.room_key)
+             WHERE EXISTS (SELECT 1 FROM messages
+                            WHERE messages.room_key = room_sequences.room_key
+                              AND messages.room_seq > room_sequences.last_seq)
+        """)
 
     def query_history(self, uid: int, target_uid: int,
                       before_mid: int = 0, limit: int = 50,
@@ -529,21 +683,21 @@ class MessagesDb(Db):
             """SELECT
                  CASE WHEN m.sender_uid = ? THEN m.receiver_uid ELSE m.sender_uid END AS partner_uid,
                  m.mid, m.client_mid, m.sender_uid, m.content, m.content_type, m.send_time,
-                 m.deleted, m.deleted_at, m.file_name, latest.room_current_seq
-               FROM (
-                 SELECT room_key,
-                        MAX(CASE WHEN content_type != 'event' THEN mid END) AS max_mid,
-                        MAX(room_seq) AS room_current_seq
-                 FROM messages
-                  WHERE group_id IS NULL
-                   AND (sender_uid = ? OR receiver_uid = ?)
-                   AND sender_uid != receiver_uid
-                  GROUP BY room_key
-               ) AS latest
-               INNER JOIN messages m ON m.mid = latest.max_mid
-               WHERE latest.max_mid IS NOT NULL
+                 m.deleted, m.deleted_at, m.file_name,
+                 (SELECT e.room_seq FROM messages e
+                   WHERE e.room_key = d.room_key AND e.group_id IS NULL AND e.sender_uid != e.receiver_uid
+                     AND (e.sender_uid = ? OR e.receiver_uid = ?)
+                   ORDER BY e.room_seq DESC LIMIT 1)
+               FROM direct_rooms d
+               JOIN messages m ON m.mid = (
+                 SELECT v.mid FROM messages v
+                  WHERE v.room_key = d.room_key AND v.group_id IS NULL AND v.content_type != 'event'
+                    AND v.sender_uid != v.receiver_uid AND (v.sender_uid = ? OR v.receiver_uid = ?)
+                  ORDER BY v.mid DESC LIMIT 1
+               )
+               WHERE d.low_uid = ? OR d.high_uid = ?
                ORDER BY m.mid DESC""",
-            (uid, uid, uid)
+            (uid, uid, uid, uid, uid, uid, uid),
         )
         return [
             {
@@ -563,33 +717,32 @@ class MessagesDb(Db):
             for r in rows
         ]
 
+    @staticmethod
+    def _requested_rooms(room_keys):
+        # A small driver table lets each room seek into (room_key, room_seq)
+        # or (room_key, mid). Keep below SQLite's compound SELECT limit.
+        keys = list(dict.fromkeys(room_keys))
+        for start in range(0, len(keys), 256):
+            batch = tuple(keys[start:start + 256])
+            cte = "WITH requested(room_key) AS ({}) ".format(
+                " UNION ALL ".join(["SELECT ?"] * len(batch)))
+            yield cte, batch
+
     def get_group_last_messages(self, group_ids: list) -> dict:
-        """批量获取多个群聊的最新消息
-        """
-        if not group_ids:
-            return {}
-        placeholders = ",".join("?" * len(group_ids))
-        rows = self.query(
-            """SELECT m.mid, m.sender_uid, m.content, m.content_type, m.send_time, m.group_id,
-                       m.deleted, m.deleted_at, m.file_name, seqs.room_current_seq
-               FROM (
-                   SELECT group_id, MAX(mid) AS max_mid
-                   FROM messages
-                    WHERE group_id IN ({})
-                      AND content_type != 'event'
-                   GROUP BY group_id
-               ) AS latest
-               INNER JOIN messages m
-                 ON m.group_id = latest.group_id AND m.mid = latest.max_mid
-               INNER JOIN (
-                   SELECT group_id AS gk, MAX(room_seq) AS room_current_seq
-                   FROM messages
-                    WHERE group_id IN ({})
-                   GROUP BY group_id
-               ) AS seqs ON seqs.gk = latest.group_id
-            """.format(placeholders, placeholders),
-            tuple(group_ids) + tuple(group_ids)
-        )
+        """批量获取多个群聊的最新消息，事件参与房间序号但不作为预览。"""
+        rows = []
+        for cte, keys in self._requested_rooms("G{}".format(gid) for gid in (group_ids or ())):
+            rows.extend(self.query(
+                cte + """SELECT m.mid, m.sender_uid, m.content, m.content_type,
+                         m.send_time, m.group_id, m.deleted, m.deleted_at, m.file_name,
+                         (SELECT MAX(room_seq) FROM messages WHERE room_key = r.room_key)
+                    FROM requested r
+                    JOIN messages m ON m.mid = (
+                       SELECT mid FROM messages WHERE room_key = r.room_key
+                         AND content_type != 'event' ORDER BY mid DESC LIMIT 1
+                    )""",
+                keys,
+            ))
         return {
             r[5]: {
                 "mid": r[0], "sender_uid": r[1], "content": None if r[6] else r[2],
@@ -618,8 +771,7 @@ class MessagesDb(Db):
             return False
         if group_id is not None:
             return r[2] == group_id
-        return (r[0] == sender_uid and r[1] == target_uid) or \
-               (r[0] == target_uid and r[1] == sender_uid)
+        return r[2] is None and {r[0], r[1]} == {sender_uid, target_uid}
 
     def get_messages_by_mids(self, mids: list) -> dict:
         """按 mid 批量取消息"""
@@ -690,13 +842,13 @@ class MessagesDb(Db):
         )
 
     def get_by_client_mid(self, sender_uid : int, client_mid : str):
-        if not client_mid:
+        if client_mid is None:
             return None
         rows = self.query(
-            "SELECT mid FROM messages WHERE sender_uid = ? AND client_mid = ?",
+            self._SELECT_ALL + " WHERE sender_uid = ? AND client_mid = ?",
             (sender_uid, client_mid),
         )
-        return self.get_message(rows[0][0]) if rows else None
+        return self._redact_recalled(dict(zip(self._COLUMNS, rows[0]))) if rows else None
 
     def recall_message(self, mid: int, deleted_by: int, emit_event: bool = True) -> int:
         """撤回消息
@@ -712,19 +864,17 @@ class MessagesDb(Db):
                     self.conn.commit()
                     return 0
                 room_key, receiver_uid, group_id = row
-                max_row = self.cursor.execute(
-                    "SELECT MAX(room_seq) FROM messages WHERE room_key = ?",
-                    (room_key,),
-                ).fetchone()
-                room_seq = (max_row[0] + 1) if max_row and max_row[0] is not None else 1
+                room_seq = self._allocate_room_sequences_locked(room_key, 2 if emit_event else 1)
                 self.cursor.execute(
                     """UPDATE messages SET deleted = 1, deleted_at = ?, deleted_by = ?,
                        room_seq = ? WHERE mid = ? AND deleted = 0""",
                     (time.time(), deleted_by, room_seq, mid),
                 )
-                changed = self.cursor.rowcount > 0
-                if changed and emit_event:
-                    self.cursor.execute(
+                if self.cursor.rowcount == 0:
+                    self.conn.rollback()
+                    return 0
+                if emit_event:
+                    event_mid = self._insert_message_locked(
                         """INSERT INTO messages
                            (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
                              file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq)
@@ -733,12 +883,11 @@ class MessagesDb(Db):
                          self.build_event_content("message.recalled", target_mid=mid),
                          self.EVENT_CONTENT_TYPE, time.time(), room_key, room_seq + 1),
                     )
-                    event_mid = self.cursor.lastrowid
                     # 同上：撤回产生的墓碑只是抬水位，不算「读过别人的消息」
                     self._advance_read_watermark_locked(
                         deleted_by, room_key, room_seq + 1, event_mid, genuine=False)
                 self.conn.commit()
-                return room_seq if changed else 0
+                return room_seq
             return self._execute_with_retry(operation)
 
     def delete_message(self, mid: int) -> bool:
@@ -796,19 +945,19 @@ class MessagesDb(Db):
 
     def get_room_preference_map(self, uids, room_id: str) -> dict:
         """批量获取多个用户对同一房间的通知偏好"""
-        uids = [int(uid) for uid in set(uids)]
-        if not uids:
-            return {}
-        placeholders = ",".join("?" * len(uids))
-        rows = self.query(
-            "SELECT uid, is_pinned, notify_level FROM room_preferences "
-            "WHERE uid IN ({}) AND room_id = ?".format(placeholders),
-            tuple(uids) + (room_id,),
-        )
-        return {
-            row[0]: {"is_pinned": bool(row[1]), "notify_level": int(row[2])}
-            for row in rows
-        }
+        uids = list({int(uid) for uid in uids})
+        preferences = {}
+        for start in range(0, len(uids), 500):
+            batch = uids[start:start + 500]
+            placeholders = ",".join("?" * len(batch))
+            rows = self.query(
+                "SELECT uid, is_pinned, notify_level FROM room_preferences "
+                "WHERE uid IN ({}) AND room_id = ?".format(placeholders),
+                tuple(batch) + (room_id,),
+            )
+            for uid, pinned, level in rows:
+                preferences[uid] = {"is_pinned": bool(pinned), "notify_level": int(level)}
+        return preferences
 
     def get_room_preference(self, uid: int, room_id: str) -> dict:
         rows = self.query(
@@ -828,83 +977,63 @@ class MessagesDb(Db):
     def update_room_preference(self, uid: int, room_id: str,
                                is_pinned=None, notify_level=None,
                                alias=None, description=None) -> bool:
-        current = self.query(
-            "SELECT is_pinned, notify_level, alias, description "
-            "FROM room_preferences WHERE uid = ? AND room_id = ?",
-            (uid, room_id),
-        )
-        pinned = int(bool(is_pinned)) if is_pinned is not None else (
-            int(current[0][0]) if current else 0
-        )
-        level = int(notify_level) if notify_level is not None else (
-            int(current[0][1]) if current else 0
-        )
+        level = int(notify_level) if notify_level is not None else 0
         if level not in (0, 1, 2):
             return False
-        alias_value = str(alias) if alias is not None else (
-            (current[0][2] or "") if current else ""
-        )
-        description_value = str(description) if description is not None else (
-            (current[0][3] or "") if current else ""
+        columns = {
+            "is_pinned": is_pinned,
+            "notify_level": notify_level,
+            "alias": alias,
+            "description": description,
+            "updated_at": True,
+        }
+        assignments = ", ".join(
+            f"{column} = excluded.{column}" for column, value in columns.items()
+            if value is not None
         )
         self.execute(
             """INSERT INTO room_preferences(uid, room_id, is_pinned, notify_level, alias, description, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(uid, room_id) DO UPDATE SET
-                 is_pinned = excluded.is_pinned,
-                 notify_level = excluded.notify_level,
-                 alias = excluded.alias,
-                 description = excluded.description,
-                 updated_at = excluded.updated_at""",
-            (uid, room_id, pinned, level, alias_value, description_value, time.time()),
+               ON CONFLICT(uid, room_id) DO UPDATE SET {}""".format(assignments),
+            (uid, room_id, int(bool(is_pinned)), level, str(alias) if alias is not None else "",
+             str(description) if description is not None else "", time.time()),
         )
         return True
+
+    def _watermark_upsert(self, genuine):
+        newer = "excluded.last_read_seq > room_read_state.last_read_seq"
+        changed = newer
+        if genuine:
+            changed += " OR excluded.last_read_mid > room_read_state.last_read_mid"
+        # MySQL evaluates column assignments left-to-right. Test the old values
+        # for the timestamp and mid before assigning the new sequence.
+        assignments = [
+            f"updated_at = CASE WHEN {changed} THEN excluded.updated_at ELSE room_read_state.updated_at END"
+        ]
+        if genuine:
+            assignments.append(
+                f"last_read_mid = CASE WHEN {changed} THEN excluded.last_read_mid ELSE room_read_state.last_read_mid END")
+        assignments.append(
+            f"last_read_seq = CASE WHEN {newer} THEN excluded.last_read_seq ELSE room_read_state.last_read_seq END")
+        sql = ("INSERT INTO room_read_state(uid, room_key, last_read_seq, last_read_mid, updated_at) "
+               "VALUES (?, ?, ?, ?, ?) ON CONFLICT(uid, room_key) DO UPDATE SET " + ", ".join(assignments))
+        if not isinstance(self.dialect, MySQLDialect):
+            # Keep rowcount zero when both the sequence and genuine mid are stale.
+            sql += " WHERE " + changed
+        return sql
 
     def _advance_read_watermark_locked(self, uid: int, room_key: str,
                                        seq: int, mid: int,
                                        genuine: bool = True) -> bool:
-        """推进已读（单调不回退）。调用方必须持有 self.lock!!
-        """
+        """Sequence comparisons and updates run atomically across server processes."""
         if not seq or seq <= 0:
             return False
-        row = self.cursor.execute(
-            "SELECT last_read_seq, last_read_mid FROM room_read_state "
-            "WHERE uid = ? AND room_key = ?",
-            (uid, room_key),
-        ).fetchone()
-        now = time.time()
-        if row is not None:
-            last_seq, last_mid = row[0], row[1]
-            if last_seq is not None and last_seq >= seq:
-                if not genuine:
-                    return False
-                if int(mid or 0) > int(last_mid or 0):
-                    self.cursor.execute(
-                        "UPDATE room_read_state SET last_read_mid = ?, updated_at = ? "
-                        "WHERE uid = ? AND room_key = ?",
-                        (mid, now, uid, room_key),
-                    )
-                return int(mid or 0) > 0
-            if genuine:
-                self.cursor.execute(
-                    "UPDATE room_read_state SET last_read_seq = ?, last_read_mid = ?, updated_at = ? "
-                    "WHERE uid = ? AND room_key = ?",
-                    (seq, mid, now, uid, room_key),
-                )
-            else:
-                self.cursor.execute(
-                    "UPDATE room_read_state SET last_read_seq = ?, updated_at = ? "
-                    "WHERE uid = ? AND room_key = ?",
-                    (seq, now, uid, room_key),
-                )
-            return True
-        # 没有行：显式已读记 mid，隐式推进只抬水位（mid=0 = 尚未真正读过）
         self.cursor.execute(
-            "INSERT INTO room_read_state(uid, room_key, last_read_seq, last_read_mid, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (uid, room_key, seq, mid if genuine else 0, now),
+            self._explicit_watermark if genuine else self._implicit_watermark,
+            (uid, room_key, seq, mid if genuine else 0, time.time()),
         )
-        return True
+        # A genuine receipt with a valid mid is acknowledged on retry as well.
+        return self.cursor.rowcount > 0 or (genuine and int(mid or 0) > 0)
 
     def update_read_state(self, uid: int, room_key: str, last_seq: int,
                           last_mid: int) -> bool:
@@ -956,70 +1085,46 @@ class MessagesDb(Db):
         ]
 
     def init_read_watermarks(self, uid: int, room_keys) -> None:
-        """为尚无已读的房间建立 base（当前 MAX(room_seq)）。。
-        """
-        keys = [k for k in set(room_keys) if k]
-        if not keys:
-            return
-        placeholders = ",".join("?" * len(keys))
-        rows = self.query(
-            "SELECT room_key, MAX(room_seq) FROM messages "
-            "WHERE room_key IN ({}) GROUP BY room_key".format(placeholders),
-            tuple(keys),
-        )
-        existing = self.query(
-            "SELECT room_key FROM room_read_state "
-            "WHERE uid = ? AND room_key IN ({})".format(placeholders),
-            (uid,) + tuple(keys),
-        )
-        have = {r[0] for r in existing}
+        """为已有消息且尚无已读水位的房间建立初始水位。"""
         now = time.time()
-        values = [
-            (uid, key, int(seq or 0), 0, now)
-            for key, seq in rows
-            if key not in have
-        ]
-        if values:
-            self.update(
-                "INSERT OR IGNORE INTO room_read_state"
-                "(uid, room_key, last_read_seq, last_read_mid, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                values,
+        for cte, keys in self._requested_rooms(k for k in room_keys if k):
+            rows = self.query(
+                cte + """SELECT r.room_key,
+                          (SELECT MAX(room_seq) FROM messages WHERE room_key = r.room_key)
+                     FROM requested r WHERE NOT EXISTS (
+                       SELECT 1 FROM room_read_state WHERE uid = ? AND room_key = r.room_key
+                     )""",
+                keys + (uid,),
             )
+            values = [(uid, key, seq, 0, now) for key, seq in rows if seq is not None]
+            if values:
+                self.update(
+                    "INSERT OR IGNORE INTO room_read_state"
+                    "(uid, room_key, last_read_seq, last_read_mid, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    values,
+                )
 
     def _count_unread(self, uid: int, keys, mentions_only: bool = False) -> dict:
-        """
-        统计未读
-        room_seq 高于、非自己发送、非事件行、未删除
-        """
-        placeholders = ",".join("?" * len(keys))
-        if mentions_only:
-            sql = """SELECT m.room_key, COUNT(DISTINCT m.mid)
-                       FROM messages m
-                       JOIN message_mentions mm ON mm.mid = m.mid AND mm.uid = ?
-                       LEFT JOIN room_read_state r
-                         ON r.uid = ? AND r.room_key = m.room_key
-                      WHERE m.room_key IN ({})
-                        AND m.room_seq > COALESCE(r.last_read_seq, 0)
-                        AND m.sender_uid != ?
-                        AND m.content_type != 'event'
-                        AND m.deleted = 0
-                      GROUP BY m.room_key""".format(placeholders)
-            params = (uid, uid) + tuple(keys) + (uid,)
-        else:
-            sql = """SELECT m.room_key, COUNT(*)
-                       FROM messages m
-                       LEFT JOIN room_read_state r
-                         ON r.uid = ? AND r.room_key = m.room_key
-                      WHERE m.room_key IN ({})
-                        AND m.room_seq > COALESCE(r.last_read_seq, 0)
-                        AND m.sender_uid != ?
-                        AND m.content_type != 'event'
-                        AND m.deleted = 0
-                      GROUP BY m.room_key""".format(placeholders)
-            params = (uid,) + tuple(keys) + (uid,)
-        rows = self.query(sql, params)
-        return {r[0]: int(r[1]) for r in rows}
+        """按房间从已读水位开始扫描。静音房间在调用方跳过。"""
+        mention_filter = (
+            "AND EXISTS (SELECT 1 FROM message_mentions mm WHERE mm.mid = m.mid AND mm.uid = ?)"
+            if mentions_only else ""
+        )
+        counts = {}
+        for cte, batch in self._requested_rooms(keys):
+            rows = self.query(
+                cte + """SELECT r.room_key, (
+                        SELECT COUNT(*) FROM messages m
+                         WHERE m.room_key = r.room_key AND m.room_seq > COALESCE(s.last_read_seq, 0)
+                           AND m.sender_uid != ? AND m.content_type != 'event' AND m.deleted = 0
+                           {}
+                    ) FROM requested r LEFT JOIN room_read_state s
+                        ON s.room_key = r.room_key AND s.uid = ?""".format(mention_filter),
+                batch + ((uid, uid, uid) if mentions_only else (uid, uid)),
+            )
+            counts.update((key, int(count)) for key, count in rows if count)
+        return counts
 
     def bulk_unread_counts(self, uid: int, room_keys, notify_level_map=None) -> dict:
         """批量计算各房间未读条数
@@ -1036,14 +1141,6 @@ class MessagesDb(Db):
         if level1:
             counts.update(self._count_unread(uid, level1, mentions_only=True))
         return counts
-
-    def set_message_mentions(self, mid: int, mentioned_uids) -> None:
-        values = [(mid, int(uid)) for uid in set(mentioned_uids)]
-        if values:
-            self.update(
-                "INSERT OR IGNORE INTO message_mentions(mid, uid) VALUES (?, ?)",
-                values,
-            )
 
     def pin_message(self, message_id: int, group_id: int, pinned_by_uid: int) -> int:
         with self.lock:

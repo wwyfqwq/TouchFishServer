@@ -149,6 +149,7 @@ class FileDb(Db):
             def operation():
                 self.cursor.execute("SELECT 1 FROM file WHERE hash = ?", (hashes,))
                 if self.cursor.fetchone() is None:
+                    self.conn.commit()
                     return False
                 self.cursor.execute(
                     """INSERT INTO file_references(hash, source_type, source_id, referrer_uid, created_at, last_referenced_at)
@@ -692,24 +693,52 @@ class FileDb(Db):
         )
         return rows[0][0] if rows else None
 
-    def reconcile_references(self, references=()):
+    def reconcile_references(self, references=(), stale_message_reference_cutoff=None):
         """确认引用"""
         with self.lock:
             def operation():
+                now = time.time()
                 self.cursor.execute("SELECT hash FROM file")
                 hashes = {row[0] for row in self.cursor.fetchall()}
                 self.cursor.execute("""INSERT OR IGNORE INTO file_uploaders(hash, uid, created_at)
-                    SELECT hash, uid, COALESCE(upload_time, ?) FROM user_file WHERE active = TRUE""", (time.time(),))
+                    SELECT hash, uid, COALESCE(upload_time, ?) FROM user_file WHERE active = TRUE""", (now,))
+                live_messages = set()
                 for hashes_value, source_type, source_id, referrer_uid in references:
                     if hashes_value not in hashes:
                         continue
+                    source_id = str(source_id)
+                    if source_type == "message":
+                        live_messages.add((hashes_value, source_id))
                     self.cursor.execute(
                         """INSERT OR IGNORE INTO file_references
                            (hash, source_type, source_id, referrer_uid, created_at, last_referenced_at)
                            VALUES (?, ?, ?, ?, ?, ?)""",
-                        (hashes_value, source_type, str(source_id), referrer_uid, time.time(), time.time()),
+                        (hashes_value, source_type, source_id, referrer_uid, now, now),
                     )
                     self.cursor.execute("DELETE FROM file_gc WHERE hash = ?", (hashes_value,))
+                if stale_message_reference_cutoff is not None:
+                    self.cursor.execute(
+                        """SELECT hash, source_id FROM file_references
+                           WHERE source_type = 'message' AND last_referenced_at < ?""",
+                        (stale_message_reference_cutoff,),
+                    )
+                    stale = [
+                        (hash_value, source_id) for hash_value, source_id in self.cursor.fetchall()
+                        if (hash_value, source_id) not in live_messages
+                    ]
+                    if stale:
+                        self.cursor.executemany(
+                            """DELETE FROM file_references WHERE hash = ?
+                               AND source_type = 'message' AND source_id = ?
+                               AND last_referenced_at < ?""",
+                            [(h, source_id, stale_message_reference_cutoff) for h, source_id in stale],
+                        )
+                        self.cursor.executemany(
+                            """INSERT OR IGNORE INTO file_gc(hash, zero_references_at)
+                               SELECT ?, ? WHERE EXISTS (SELECT 1 FROM file WHERE hash = ?)
+                                   AND NOT EXISTS (SELECT 1 FROM file_references WHERE hash = ?)""",
+                            [(h, now, h, h) for h in {h for h, _ in stale}],
+                        )
                 self.conn.commit()
                 return len(hashes)
 

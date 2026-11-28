@@ -11,6 +11,8 @@ JWT 签发密钥环（本服作为签发方）。
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -185,9 +187,10 @@ class KeyStore:
     def __init__(self, secret_dir, *, rsa_key_size=DEFAULT_RSA_KEY_SIZE):
         self.rsa_key_size = normalize_rsa_key_size(rsa_key_size)
         self.directory = os.path.join(secret_dir, "jwt_keys")
-        os.makedirs(self.directory, exist_ok=True)
         self.index_path = os.path.join(self.directory, self.INDEX_FILE)
+        self._mutation_path = os.path.join(self.directory, ".mutation")
         self._lock = threading.RLock()
+        self._writing = False
         self._index = None
         self._index_stat = None
         # 启动时清一次超保留期的旧钥
@@ -199,19 +202,33 @@ class KeyStore:
 
     # Windows Search Index（bushi）
 
+    @contextmanager
+    def _mutation(self):
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        with json_store.file_lock(self._mutation_path):
+            self._index = None
+            self._writing = True
+            try:
+                yield
+            finally:
+                self._writing = False
+                # A failed rotation may have changed only the in-memory entries.
+                self._index = None
+
     def _empty_index(self):
         return {"version": 1, "keys": []}
 
     def _index_file_stat(self):
         try:
             stat = os.stat(self.index_path)
-            return (stat.st_mtime_ns, stat.st_size)
+            return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
         except OSError:
             return None
 
     def _load_index_locked(self):
+        snapshot = self._index_file_stat()
         if self._index is not None:
-            if self._index_file_stat() == self._index_stat:
+            if snapshot == self._index_stat:
                 return self._index
             # 索引被外部进程改了
             self._index = None
@@ -257,14 +274,21 @@ class KeyStore:
         except Exception as error:
             print("[WARN] JWT 密钥索引损坏，尝试从 PEM 重建: {}".format(error))
             index = None
-        if index is None:
-            index = self._rebuild_index_locked()
-        elif not index["keys"] and self._has_key_files_locked():
-            # 索引被清空但目录里还有 PEM：按 PEM 重建
-            index = self._rebuild_index_locked()
-        self._index = index
-        self._index_stat = self._index_file_stat()
-        return index
+        if (index is None or not index["keys"]) and self._has_key_files_locked():
+            if self._writing:
+                return self._rebuild_index_locked()
+            # An initializing process may have published a PEM and still be preparing
+            # its index. Read that index under the same mutation lock before recovery.
+            try:
+                with self._mutation():
+                    return self._load_index_locked()
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EROFS, errno.EPERM):
+                    raise
+                return self._rebuild_index_locked(persist=False)
+        self._index = index or self._empty_index()
+        self._index_stat = snapshot
+        return self._index
 
     def _has_key_files_locked(self):
         try:
@@ -275,7 +299,7 @@ class KeyStore:
         except OSError:
             return False
 
-    def _rebuild_index_locked(self):
+    def _rebuild_index_locked(self, *, persist=True):
         """索引缺失/损坏时，从目录里的 PEM 恢复（算法推断。"""
         entries = []
         try:
@@ -315,10 +339,11 @@ class KeyStore:
             group[0]["active"] = True
         index = {"version": 1, "keys": entries}
         self._index = index
-        try:
-            self._write_index_locked()
-        except Exception as error:
-            print("[WARN] 写入 JWT 密钥索引失败: {}".format(error))
+        if persist:
+            try:
+                self._write_index_locked()
+            except Exception as error:
+                print("[WARN] 写入 JWT 密钥索引失败: {}".format(error))
         self._index_stat = self._index_file_stat()
         return index
 
@@ -440,7 +465,7 @@ class KeyStore:
             entry["active"] = False
             if entry.get("retired_at") is None:
                 entry["retired_at"] = time.time()
-        if candidates:
+        if candidates and self._writing:
             try:
                 self._write_index_locked()
             except Exception:
@@ -455,7 +480,10 @@ class KeyStore:
         with self._lock:
             entry = self._active_entry_locked(algorithm)
             if entry is None:
-                entry = self._generate_locked(algorithm)
+                with self._mutation():
+                    entry = self._active_entry_locked(algorithm)
+                    if entry is None:
+                        entry = self._generate_locked(algorithm)
             return entry["_private"], entry["kid"]
 
     def active_kid(self, algorithm):
@@ -471,7 +499,7 @@ class KeyStore:
         algorithm = normalize_algorithm(algorithm, default=None)
         if algorithm not in ASYMMETRIC_ALGORITHMS:
             raise ValueError("unsupported JWT signing algorithm: {}".format(algorithm))
-        with self._lock:
+        with self._lock, self._mutation():
             index = self._load_index_locked()
             now = time.time()
             for entry in index["keys"]:
@@ -486,38 +514,39 @@ class KeyStore:
     def prune(self, retention_days=DEFAULT_RETENTION_DAYS):
         """清理超过保留期的旧钥，返回删除数量。"""
         with self._lock:
-            removed = self._prune_locked(retention_days)
-            if removed:
-                self._write_index_locked()
-            return removed
+            entries = self._load_index_locked()["keys"]
+            if not any(self._expired_keys(entries, retention_days)):
+                return 0
+            with self._mutation():
+                removed = self._prune_locked(retention_days)
+                if removed:
+                    self._write_index_locked()
+                return removed
 
-    def _prune_locked(self, retention_days):
+    @staticmethod
+    def _expired_keys(entries, retention_days):
         try:
             days = float(retention_days)
         except (TypeError, ValueError):
             days = DEFAULT_RETENTION_DAYS
         if days < 0:
             days = 0
-        index = self._load_index_locked()
         cutoff = time.time() - days * 86400
-        kept = []
-        removed = []
-        for entry in index["keys"]:
-            retired_at = entry.get("retired_at")
-            if (retired_at is not None
-                    and not entry.get("active")
-                    and float(retired_at) < cutoff):
-                removed.append(entry)
-            else:
-                kept.append(entry)
-        if removed:
-            index["keys"] = kept
-            for entry in removed:
+        return (entry for entry in entries if entry.get("retired_at") is not None
+                and not entry.get("active") and float(entry["retired_at"]) < cutoff)
+
+    def _prune_locked(self, retention_days):
+        index = self._load_index_locked()
+        expired = list(self._expired_keys(index["keys"], retention_days))
+        if expired:
+            retired_kids = {entry["kid"] for entry in expired}
+            index["keys"] = [entry for entry in index["keys"] if entry["kid"] not in retired_kids]
+            for entry in expired:
                 try:
                     os.remove(self._key_path(entry))
                 except OSError:
                     pass
-        return len(removed)
+        return len(expired)
 
     # reading public keys
     # 阿三公司使用 4 作为私钥(bushi)

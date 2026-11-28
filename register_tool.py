@@ -15,6 +15,8 @@ from email.header import Header
 from threading import BoundedSemaphore
 from time import time
 
+from json_store import read_json, update_json
+
 MAX_DELAY = 300
 EMAIL_CODE_TTL = 600
 EMAIL_CODE_ATTEMPTS = 5
@@ -52,7 +54,7 @@ def send_email(server, sender_email : str, receiver_email : str, subject : str, 
     msg.attach(MIMEText(content, "plain", "utf-8"))
     try:
         server.sendmail(sender_email, receiver_email, msg.as_string())
-    except:
+    except (smtplib.SMTPException, OSError):
         return False
     return True
 
